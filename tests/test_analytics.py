@@ -20,7 +20,7 @@ def _add_alumni(db_session, organization, **overrides):
     return alumni
 
 
-def test_analytics_groups_cities_by_city_and_state_not_merged(client, db_session, organization):
+def test_analytics_groups_cities_by_city_and_state_not_merged(client, db_session, organization, admin_user):
     _add_alumni(db_session, organization, full_name="A B", city="Brooklyn", state="New York", metro_area="New York City Metropolitan Area")
     _add_alumni(db_session, organization, full_name="C D", city="New York City", state="New York", metro_area="New York City Metropolitan Area")
     _add_alumni(db_session, organization, full_name="E F", city="Brooklyn", state="New York", metro_area="New York City Metropolitan Area")
@@ -37,7 +37,7 @@ def test_analytics_groups_cities_by_city_and_state_not_merged(client, db_session
     assert cities[("New York City", "New York")] == 1
 
 
-def test_analytics_groups_metro_areas_together(client, db_session, organization):
+def test_analytics_groups_metro_areas_together(client, db_session, organization, admin_user):
     _add_alumni(db_session, organization, full_name="A B", city="Brooklyn", state="New York", metro_area="New York City Metropolitan Area")
     _add_alumni(db_session, organization, full_name="C D", city="New York City", state="New York", metro_area="New York City Metropolitan Area")
 
@@ -50,7 +50,7 @@ def test_analytics_groups_metro_areas_together(client, db_session, organization)
     assert metro_counts["New York City Metropolitan Area"] == 2
 
 
-def test_analytics_verification_percentage(client, db_session, organization):
+def test_analytics_verification_percentage(client, db_session, organization, admin_user):
     _add_alumni(db_session, organization, full_name="A B", verified=True)
     _add_alumni(db_session, organization, full_name="C D", verified=False, verification_status="unverified")
 

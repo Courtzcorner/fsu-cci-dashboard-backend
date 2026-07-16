@@ -13,6 +13,7 @@ class ImportResult(BaseModel):
     skipped: int
     failed: int
     row_errors: list[RowError]
+    csv_import_id: str | None = None
 
 
 class NormalizeLocationsResult(BaseModel):

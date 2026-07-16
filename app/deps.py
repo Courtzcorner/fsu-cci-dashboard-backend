@@ -1,19 +1,8 @@
 """
-Shared FastAPI dependencies: current-user resolution from a Bearer JWT,
-and organization resolution for alumni/analytics endpoints.
-
-Login credentials (and therefore identity + role) come from the
-backend-only `data/users.csv` file (see app.csv_user_store). The JWT is
-the signed source of truth for `username`/`role` on every subsequent
-request - it is never re-read from the CSV on each call, so a request
-only needs the token, not a DB/file round trip.
-
-Organizations (used to segment alumni data) still live in the database.
-Since CSV-based users are not assigned to specific organizations, any
-authenticated user (admin or alumni) may currently view any organization's
-dashboard - see the `organization` query param resolution below. Only the
-`role` claim (currently "admin"/"alumni") gates admin-only actions such as
-CSV import.
+Shared FastAPI dependencies: current-user resolution from a Bearer JWT
+(re-fetched from the `users` table on every request, so role/alumni_id
+changes take effect immediately), and organization resolution for
+alumni/content endpoints.
 """
 from dataclasses import dataclass
 
@@ -23,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.organization import Organization
+from app.models.user import User
 from app.security import TokenError, decode_access_token
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -30,8 +20,10 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 @dataclass(frozen=True)
 class CurrentUser:
+    id: str
     username: str
     role: str
+    alumni_id: str | None
 
     @property
     def is_admin(self) -> bool:
@@ -40,6 +32,7 @@ class CurrentUser:
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
 ) -> CurrentUser:
     if credentials is None or not credentials.credentials:
         raise HTTPException(
@@ -57,7 +50,18 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
 
-    return CurrentUser(username=payload["sub"], role=payload["role"])
+    user = db.query(User).filter(User.username == payload["sub"]).first()
+    if user is None or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User no longer exists or is inactive",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Role/alumni_id are always read fresh from the database rather than
+    # trusted from the (possibly stale) JWT claims, so an admin change to
+    # either takes effect on the very next request.
+    return CurrentUser(id=user.id, username=user.username, role=user.role, alumni_id=user.alumni_id)
 
 
 def get_organization_by_slug_for_current_user(
@@ -66,14 +70,12 @@ def get_organization_by_slug_for_current_user(
     db: Session = Depends(get_db),
 ) -> Organization:
     """Resolve `?organization=` (falling back to DEFAULT_ORGANIZATION_SLUG)
-    to an Organization row. Any authenticated user (admin or alumni role)
-    may view any organization's dashboard for now - the role claim is kept
-    on the token so the frontend/backend can add finer-grained,
-    per-organization access later without another auth rework.
+    to an Organization row. Any authenticated user (admin or alumni) may
+    view any organization's published content for now.
     """
     from app.config import get_settings
 
-    _ = current_user  # currently unused for authorization, kept for parity with future per-org checks
+    _ = current_user  # kept for parity with future per-org access checks
     slug = organization or get_settings().default_organization_slug
     organization_record = db.query(Organization).filter(Organization.slug == slug).first()
     if organization_record is None:
@@ -84,3 +86,14 @@ def get_organization_by_slug_for_current_user(
 def require_admin_role(current_user: CurrentUser) -> None:
     if not current_user.is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
+
+
+def require_alumni_profile(current_user: CurrentUser) -> str:
+    """Returns the current user's linked alumni_id, or 404 if this account
+    has no associated alumni profile."""
+    if not current_user.alumni_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This account has no associated alumni profile",
+        )
+    return current_user.alumni_id

@@ -1,10 +1,16 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.deps import CurrentUser, get_current_user, require_admin_role
+from app.models.alumni import Alumni
+from app.models.legal_name import LegalNameChangeRequest
 from app.models.organization import Organization
 from app.schemas.admin import ImportResult, NormalizeLocationsResult, RowError
+from app.schemas.profile import LegalNameChangeRequestOut
+from app.services.audit_service import record_audit_log
 from app.services.csv_import_service import import_alumni_csv
 from app.services.location_reprocess_service import reprocess_locations
 
@@ -25,14 +31,16 @@ async def import_alumni(
     current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ImportResult:
-    organization = _resolve_organization(db, organization_slug)
     require_admin_role(current_user)
+    organization = _resolve_organization(db, organization_slug)
 
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .csv files are accepted")
 
     contents = await file.read()
-    summary = import_alumni_csv(db, organization, contents)
+    summary = import_alumni_csv(
+        db, organization, contents, imported_by_user_id=current_user.id, filename=file.filename
+    )
 
     return ImportResult(
         organization=organization.slug,
@@ -41,6 +49,7 @@ async def import_alumni(
         skipped=summary.skipped,
         failed=summary.failed,
         row_errors=[RowError(**e) for e in summary.row_errors],
+        csv_import_id=summary.csv_import_id,
     )
 
 
@@ -73,3 +82,88 @@ def normalize_locations(
         unchanged=result["unchanged"],
         dry_run=dry_run,
     )
+
+
+# --------------------------------------------------------------------------
+# Legal name change request review
+# --------------------------------------------------------------------------
+
+
+@router.get("/legal-name-requests", response_model=list[LegalNameChangeRequestOut])
+def list_legal_name_requests(
+    status_filter: str | None = None,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[LegalNameChangeRequest]:
+    require_admin_role(current_user)
+    query = db.query(LegalNameChangeRequest)
+    if status_filter:
+        query = query.filter(LegalNameChangeRequest.status == status_filter)
+    return query.order_by(LegalNameChangeRequest.created_at.asc()).all()
+
+
+def _resolve_pending_request(db: Session, request_id: str) -> LegalNameChangeRequest:
+    request = db.get(LegalNameChangeRequest, request_id)
+    if request is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Legal name change request not found")
+    if request.status != "pending_review":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Request has already been reviewed")
+    return request
+
+
+@router.post("/legal-name-requests/{request_id}/approve", response_model=LegalNameChangeRequestOut)
+def approve_legal_name_request(
+    request_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> LegalNameChangeRequest:
+    require_admin_role(current_user)
+    request = _resolve_pending_request(db, request_id)
+
+    alumni = db.get(Alumni, request.alumni_id)
+    if alumni is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alumni record not found")
+
+    now = datetime.now(timezone.utc)
+    alumni.verified_legal_name = request.requested_legal_name
+    alumni.legal_name_verified = True
+    alumni.legal_name_verification_status = "verified"
+    alumni.legal_name_verified_at = now.date()
+
+    request.status = "approved"
+    request.reviewed_by_user_id = current_user.id
+    request.reviewed_at = now
+
+    record_audit_log(
+        db, user_id=current_user.id, action="approve", entity_type="legal_name_change_request",
+        entity_id=request.id, details={"alumni_id": alumni.id},
+    )
+    db.commit()
+    db.refresh(request)
+    return request
+
+
+@router.post("/legal-name-requests/{request_id}/reject", response_model=LegalNameChangeRequestOut)
+def reject_legal_name_request(
+    request_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> LegalNameChangeRequest:
+    require_admin_role(current_user)
+    request = _resolve_pending_request(db, request_id)
+
+    alumni = db.get(Alumni, request.alumni_id)
+    if alumni is not None:
+        alumni.legal_name_verification_status = "rejected"
+
+    request.status = "rejected"
+    request.reviewed_by_user_id = current_user.id
+    request.reviewed_at = datetime.now(timezone.utc)
+
+    record_audit_log(
+        db, user_id=current_user.id, action="reject", entity_type="legal_name_change_request",
+        entity_id=request.id, details={"alumni_id": request.alumni_id},
+    )
+    db.commit()
+    db.refresh(request)
+    return request

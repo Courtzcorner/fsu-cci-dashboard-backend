@@ -3,26 +3,37 @@ from enum import Enum
 
 
 class UserRole(str, Enum):
-    SUPER_ADMIN = "super_admin"
-    ORGANIZATION_ADMIN = "organization_admin"
+    """The application has exactly two primary roles. Admins manage shared
+    content; alumni view published content and their own profile."""
+
+    ADMIN = "admin"
     ALUMNI = "alumni"
-    VIEWER = "viewer"
-
-
-# Priority order used to pick a "primary" role to show at the top level of
-# the login response when a user belongs to multiple organizations.
-ROLE_PRIORITY = [
-    UserRole.SUPER_ADMIN,
-    UserRole.ORGANIZATION_ADMIN,
-    UserRole.ALUMNI,
-    UserRole.VIEWER,
-]
 
 
 class VerificationStatus(str, Enum):
     VERIFIED = "verified"
     UNVERIFIED = "unverified"
     PENDING = "pending"
+
+
+class LegalNameVerificationStatus(str, Enum):
+    UNVERIFIED = "unverified"
+    PENDING_REVIEW = "pending_review"
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+    CHANGE_REQUESTED = "change_requested"
+
+
+class LegalNameChangeRequestStatus(str, Enum):
+    PENDING_REVIEW = "pending_review"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class ProfileVisibility(str, Enum):
+    PUBLIC = "public"
+    ORGANIZATION = "organization"
+    PRIVATE = "private"
 
 
 class DataSource(str, Enum):

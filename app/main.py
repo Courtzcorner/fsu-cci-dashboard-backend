@@ -3,6 +3,7 @@ import logging
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -11,6 +12,8 @@ from app.routers.admin_routes import router as admin_router
 from app.routers.alumni_routes import router as alumni_router
 from app.routers.analytics_routes import router as analytics_router
 from app.routers.auth_routes import limiter, router as auth_router
+from app.routers.content_routes import router as content_router
+from app.routers.profile_routes import router as profile_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,3 +86,11 @@ app.include_router(auth_router)
 app.include_router(alumni_router)
 app.include_router(analytics_router)
 app.include_router(admin_router)
+app.include_router(content_router)
+app.include_router(profile_router)
+
+# Serve uploaded profile photos (local storage provider only). Only files
+# saved through app.services.storage_service (server-generated filenames)
+# live under this directory - nothing else is ever written here.
+settings.uploads_dir_full_path.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(settings.uploads_dir_full_path)), name="uploads")

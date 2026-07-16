@@ -13,8 +13,18 @@ class Alumni(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     first_name: Mapped[str] = mapped_column(String(128), nullable=False)
     last_name: Mapped[str] = mapped_column(String(128), nullable=False)
     full_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    preferred_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # --- Legal name verification (admin-reviewed workflow) ---
+    # Raw government ID images are never stored here (or anywhere in this
+    # database) - only the resulting verified text value.
+    verified_legal_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    legal_name_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    legal_name_verification_status: Mapped[str] = mapped_column(String(32), default="unverified", nullable=False)
+    legal_name_verified_at: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     graduation_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    graduation_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     major: Mapped[str | None] = mapped_column(String(255), nullable=True)
     degree: Mapped[str | None] = mapped_column(String(255), nullable=True)
     university: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -34,6 +44,10 @@ class Alumni(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     verification_status: Mapped[str] = mapped_column(String(32), default="unverified", nullable=False)
     verification_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+    profile_image_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    bio: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    profile_visibility: Mapped[str] = mapped_column(String(32), default="organization", nullable=False)
 
     profile_completion: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
@@ -56,6 +70,7 @@ class Alumni(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     organization_links = relationship(
         "AlumniOrganization", back_populates="alumni", cascade="all, delete-orphan"
     )
+    user_account = relationship("User", back_populates="alumni", uselist=False)
 
     def __repr__(self) -> str:
         return f"<Alumni full_name={self.full_name!r}>"

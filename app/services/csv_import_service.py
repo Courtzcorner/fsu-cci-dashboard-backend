@@ -13,6 +13,7 @@ Responsibilities:
 """
 import csv
 import io
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -20,7 +21,10 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.models.alumni import Alumni, AlumniOrganization
+from app.models.audit import CSVImport
 from app.models.organization import Organization
+from app.models.reference import Company, Industry, University
+from app.services.audit_service import record_audit_log
 from app.services.classification_service import classify_alumni_fields
 from app.services.location_normalization_service import normalize_location
 
@@ -119,6 +123,7 @@ class ImportSummary:
     skipped: int = 0
     failed: int = 0
     row_errors: list[dict] = field(default_factory=list)
+    csv_import_id: str | None = None
 
 
 def _find_existing_alumni(
@@ -159,6 +164,18 @@ def _find_existing_alumni(
     return None
 
 
+def _get_or_create_reference(db: Session, model, organization_id: str, name: str | None, cache: dict) -> None:
+    if not name:
+        return
+    key = (model, name.strip().lower())
+    if key in cache:
+        return
+    existing = db.query(model).filter(model.organization_id == organization_id, model.name == name).first()
+    if existing is None:
+        db.add(model(organization_id=organization_id, name=name))
+    cache[key] = True
+
+
 def _compute_profile_completion(row: dict) -> int:
     tracked_fields = [
         "job_title", "company", "industry", "major", "degree", "university",
@@ -168,8 +185,15 @@ def _compute_profile_completion(row: dict) -> int:
     return round((filled / len(tracked_fields)) * 100)
 
 
-def import_alumni_csv(db: Session, organization: Organization, file_bytes: bytes) -> ImportSummary:
+def import_alumni_csv(
+    db: Session,
+    organization: Organization,
+    file_bytes: bytes,
+    imported_by_user_id: str | None = None,
+    filename: str | None = None,
+) -> ImportSummary:
     summary = ImportSummary()
+    reference_cache: dict = {}
 
     text = file_bytes.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
@@ -258,16 +282,61 @@ def import_alumni_csv(db: Session, organization: Organization, file_bytes: bytes
                 for key, value in field_values.items():
                     setattr(existing, key, value)
                 summary.updated += 1
+                alumni_id = existing.id
             else:
                 alumni = Alumni(**field_values)
                 db.add(alumni)
                 db.flush()
                 db.add(AlumniOrganization(alumni_id=alumni.id, organization_id=organization.id))
                 summary.created += 1
+                alumni_id = alumni.id
+
+            _get_or_create_reference(db, Company, organization.id, row.get("company"), reference_cache)
+            _get_or_create_reference(db, Industry, organization.id, field_values.get("industry"), reference_cache)
+            _get_or_create_reference(db, University, organization.id, row.get("university"), reference_cache)
+
+            record_audit_log(
+                db,
+                user_id=imported_by_user_id,
+                action="update" if existing else "create",
+                entity_type="alumni",
+                entity_id=alumni_id,
+                organization_id=organization.id,
+                details={"source": "csv_import", "row": row_index},
+            )
 
         except Exception as exc:  # noqa: BLE001 - row-level isolation is intentional
             summary.failed += 1
             summary.row_errors.append({"row": row_index, "error": str(exc)})
+
+    csv_import_record = CSVImport(
+        organization_id=organization.id,
+        filename=filename,
+        created_count=summary.created,
+        updated_count=summary.updated,
+        skipped_count=summary.skipped,
+        failed_count=summary.failed,
+        row_errors_json=json.dumps(summary.row_errors) if summary.row_errors else None,
+        imported_by_user_id=imported_by_user_id,
+    )
+    db.add(csv_import_record)
+    db.flush()
+    summary.csv_import_id = csv_import_record.id
+
+    record_audit_log(
+        db,
+        user_id=imported_by_user_id,
+        action="import",
+        entity_type="csv_import",
+        entity_id=csv_import_record.id,
+        organization_id=organization.id,
+        details={
+            "created": summary.created,
+            "updated": summary.updated,
+            "failed": summary.failed,
+            "filename": filename,
+        },
+    )
 
     db.commit()
     return summary

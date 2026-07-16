@@ -1,86 +1,104 @@
 # Alumni Dashboard API
 
-A single, multi-organization FastAPI backend for the alumni dashboard
-frontend. It serves authentication and alumni network data for **FSU
-College of Communication and Information** (`fsu-cci`) today, and is
-architected to support **FSU STARS** (`fsu-stars`) and **STARS National**
-(`stars-national`) through the same backend/database without any code
-changes - only new `organizations` rows and role assignments.
+A single FastAPI backend backed by **one shared PostgreSQL database**. All
+admin actions (CSV imports, events, speakers, Super Stars, legal-name
+review) are written directly to that database, and every alumni dashboard
+view reads from the same source of truth - nothing is ever kept only in
+memory, frontend state, local storage, or temporary files. The first
+organization is `fsu-cci`; the schema (`alumni_organizations`) supports
+more organizations later without code changes.
 
-There is intentionally **one** API and **one** database for all
-organizations; alumni data is separated by organization membership
-(`alumni_organizations`) and access is separated by user role assignment
-(`user_organization_roles`), never by spinning up separate services per
-spreadsheet/org.
+## Roles
+
+There are exactly two roles, stored on `users.role`:
+
+- **admin** - create/update/import/publish/delete shared content
+  (`/admin/*`), review legal-name-change requests, view any alumni's
+  profile via admin endpoints.
+- **alumni** - view published shared content and edit only their own
+  profile (`/me/*`).
 
 ## Authentication
 
-Login credentials live in a **backend-only CSV file** at `data/users.csv`
-(never committed - see `.gitignore`; never served by any route), with
-columns `username,password_hash,role`. Allowed roles are `admin` and
-`alumni`. Passwords are bcrypt-hashed; only the hash is ever written to
-disk. `POST /login` reads this file, verifies the password with bcrypt,
-and returns a JWT whose claims carry `username` (`sub`) and `role` - every
-subsequent request is authorized from those signed claims, not a DB/file
-lookup. Both `admin` and `alumni` roles may currently view the alumni
-dashboard; `role` is exposed on the token/response so the frontend (and
-`/admin/*` routes, which require `role == "admin"`) can act on it.
+Login credentials live in the `users` table (bcrypt-hashed passwords -
+plaintext is never stored/logged). `POST /login` verifies the password and
+returns a JWT (`sub`=username, `role` claim), but **role and profile
+linkage are always re-read from the database on every request** (see
+`app/deps.get_current_user`), so an admin changing a user's role or
+alumni link takes effect immediately without waiting for re-login.
 
-Add/update a user:
+Each alumni login account may be linked to exactly one alumni record via
+`users.alumni_id` (nullable - admin accounts typically have none). This
+powers `GET/PATCH /me/profile`.
+
+Create/update a user:
 
 ```bash
 python scripts/create_user.py --username admin --role admin
-python scripts/create_user.py --username jdoe --role alumni
+python scripts/create_user.py --username jdoe --role alumni --alumni-id <alumni-record-uuid>
 ```
 
 You'll be prompted for a password (never passed as a CLI argument or
-logged). Organizations (`fsu-cci`, `fsu-stars`, `stars-national`) and
-alumni records still live in PostgreSQL and are managed as described
-below - CSV auth only replaces *login*, not the alumni data model.
+logged).
 
-> Note: `app/models/user.py` (`users`, `user_organization_roles`) and
-> `scripts/create_admin.py` remain in the codebase from an earlier
-> DB-backed auth design and still work against Postgres, but are no
-> longer used by `POST /login` - the CSV file is now the source of truth
-> for credentials.
+> Architecture note: an earlier iteration of this backend authenticated
+> against a backend-only `data/users.csv` file. That file cannot express a
+> real foreign key to an alumni record, so authentication has moved back
+> to the `users` database table to support `alumni_id`, `created_by_user_id`,
+> and `reviewed_by_user_id` relational integrity throughout this feature
+> set. `data/users.csv` (if still present on disk) is no longer read by
+> the app and can be deleted.
 
 ## Architecture
 
 ```
 app/
-├── main.py                 FastAPI app, CORS, security headers, error handlers
-├── config.py                Settings from environment variables
-├── database.py               SQLAlchemy engine/session/Base
-├── security.py               bcrypt hashing + JWT create/verify
-├── csv_user_store.py          Read/write data/users.csv (backend-only)
-├── deps.py                   Current-user (from JWT) + organization resolution
+├── main.py                    FastAPI app, CORS, static /uploads mount, error handlers
+├── config.py                   Settings from environment variables
+├── database.py                  SQLAlchemy engine/session/Base
+├── security.py                  bcrypt hashing + JWT create/verify
+├── deps.py                      Current-user (re-fetched from DB) + organization resolution
 ├── models/
-│   ├── organization.py        organizations
-│   ├── user.py                 users, user_organization_roles
-│   ├── alumni.py                alumni, alumni_organizations
-│   ├── location_alias.py         location_aliases
-│   └── roles.py                   Role/status enums shared across the app
-├── schemas/                   Pydantic request/response models
+│   ├── organization.py           organizations
+│   ├── user.py                    users (role, alumni_id FK)
+│   ├── alumni.py                   alumni, alumni_organizations
+│   ├── content.py                   events, speakers, super_stars
+│   ├── reference.py                  companies, industries, universities
+│   ├── audit.py                       csv_imports, audit_logs
+│   ├── legal_name.py                   legal_name_change_requests
+│   ├── location_alias.py                location_aliases
+│   └── roles.py                          Role/status enums shared across the app
+├── schemas/                     Pydantic request/response models
 ├── services/
 │   ├── location_normalization_service.py   Canonical location normalization
 │   ├── us_geography.py                       State/metro/borough reference data
-│   ├── location_aliases_seed_data.py          Seed + fallback alias table
 │   ├── classification_service.py               Industry/career/seniority inference
-│   ├── csv_import_service.py                     CSV import + dedup pipeline
-│   └── location_reprocess_service.py              Shared reprocessing logic
-├── seed/seed_data.py           Organization + location alias seed data
+│   ├── csv_import_service.py                     CSV import + dedup + audit pipeline
+│   ├── location_reprocess_service.py              Shared reprocessing logic
+│   ├── audit_service.py                            record_audit_log() helper
+│   └── storage_service.py                           Profile photo upload (local/pluggable)
+├── seed/seed_data.py             Organization + location alias seed data
 └── routers/
-    ├── auth_routes.py           POST /login
-    ├── alumni_routes.py          GET /alumni-data
-    ├── analytics_routes.py        GET /analytics/summary
-    └── admin_routes.py             POST /admin/import-alumni, POST /admin/normalize-locations
-alembic/                        Migrations (SQLAlchemy 2.0 models -> Postgres schema)
+    ├── auth_routes.py             POST /login
+    ├── alumni_routes.py            GET /alumni-data
+    ├── analytics_routes.py          GET /analytics/summary
+    ├── admin_routes.py               CSV import, location reprocessing, legal-name review
+    ├── content_routes.py              /events, /speakers, /super-stars (+ /admin/* CRUD)
+    └── profile_routes.py               /me/profile, /me/profile/photo, /me/legal-name-change-request
+alembic/                         Migrations (SQLAlchemy 2.0 models -> Postgres schema)
 scripts/
-├── seed_organizations.py        Seed fsu-cci / fsu-stars / stars-national + aliases
-├── create_admin.py                Create/update a user + grant an org role
+├── seed_organizations.py         Seed fsu-cci / fsu-stars / stars-national + aliases
+├── create_user.py                  Create/update a database user (with optional alumni link)
 └── normalize_existing_locations.py CLI location reprocessing (dry-run/batch support)
-tests/                          pytest suite (auth, authz, import, location, analytics)
+tests/                          pytest suite (auth, authz, content, profile, import, location, analytics)
 ```
+
+## Database models
+
+`Alumni`, `Organization`, `User`, `Event`, `Speaker`, `SuperStar`,
+`Company`, `Industry`, `University`, `CSVImport`, `AuditLog`,
+`LegalNameChangeRequest`, `LocationAlias`. `UserRole` is a plain Python
+enum (`admin` / `alumni`) used for validation, not a separate table.
 
 ## 1. Setup
 
@@ -111,6 +129,8 @@ Edit `.env` and set at minimum:
 - `JWT_SECRET_KEY` - generate with:
   `python -c "import secrets; print(secrets.token_urlsafe(64))"`
 - `ALLOWED_ORIGINS` - your Lovable frontend URL(s), comma-separated.
+- `PUBLIC_BASE_URL` - the externally-reachable base URL of this API, used
+  to build profile photo URLs (e.g. `https://api.yourapp.com`).
 
 ### 1.4 Start PostgreSQL
 
@@ -154,10 +174,6 @@ Atlanta metro, etc.).
 python scripts/create_user.py --username admin --role admin
 ```
 
-You'll be prompted for a password (never passed as a CLI argument or
-logged). This writes a bcrypt-hashed row to `data/users.csv`, which is
-what `POST /login` authenticates against.
-
 ### 1.8 Import FSU CCI alumni
 
 ```bash
@@ -168,16 +184,26 @@ curl -X POST http://localhost:8000/admin/import-alumni \
 ```
 
 Or use the interactive docs at `/docs` to upload the file from a browser.
+Every import is recorded in `csv_imports` (created/updated/skipped/failed
+counts + row errors) and logged in `audit_logs`.
 
-### 1.9 Normalize existing locations (if importing pre-existing data directly into the DB)
+### 1.9 Link an alumni login to an alumni record
+
+```bash
+python scripts/create_user.py --username jdoe --role alumni --alumni-id <alumni-record-uuid>
+```
+
+Find the alumni record's `id` via `GET /alumni-data` (admin token) or a
+direct DB query after importing.
+
+### 1.10 Normalize existing locations (if importing pre-existing data directly into the DB)
 
 ```bash
 python scripts/normalize_existing_locations.py --organization fsu-cci --dry-run
 python scripts/normalize_existing_locations.py --organization fsu-cci
-python scripts/normalize_existing_locations.py --organization fsu-cci --batch-size 100
 ```
 
-### 1.10 Start the API
+### 1.11 Start the API
 
 ```bash
 python run.py
@@ -186,29 +212,46 @@ python run.py
 Runs at `http://localhost:8000` (interactive docs at `/docs` while
 `ENABLE_API_DOCS=true`).
 
-## 2. Testing the API manually
+## 2. API reference
 
-### Login
+### Auth
 
-```bash
-curl -X POST http://localhost:8000/login \
-  -H "Content-Type: application/json" \
-  -d '{"username": "admin", "password": "<your-password>"}'
-```
+- `POST /login` - `{ username, password }` -> `{ access_token, token_type, expires_in, user: { username, role } }`
 
-### Alumni data
+### Alumni data (shared database, paginated + filterable)
 
-```bash
-curl "http://localhost:8000/alumni-data?organization=fsu-cci&page=1&page_size=25" \
-  -H "Authorization: Bearer <access_token>"
-```
+- `GET /alumni-data?organization=fsu-cci&page=1&page_size=25` (any authenticated role)
+- `GET /analytics/summary?organization=fsu-cci` (any authenticated role)
 
-### Analytics
+### Shared content (public reads, admin-only writes)
 
-```bash
-curl "http://localhost:8000/analytics/summary?organization=fsu-cci" \
-  -H "Authorization: Bearer <access_token>"
-```
+- `GET /events` / `POST|PATCH|DELETE /admin/events[/{id}]`
+- `GET /speakers` / `POST|PATCH|DELETE /admin/speakers[/{id}]`
+- `GET /super-stars` / `POST|PATCH|DELETE /admin/super-stars[/{id}]`
+
+All three accept `?organization=<slug>` (defaults to `DEFAULT_ORGANIZATION_SLUG`).
+`GET` endpoints only ever return `is_published=true` rows.
+
+### Admin
+
+- `POST /admin/import-alumni` - `organization` (form field) + `file` (CSV)
+- `POST /admin/normalize-locations`
+- `GET /admin/legal-name-requests`, `POST /admin/legal-name-requests/{id}/approve|reject`
+
+### Alumni self-service profile
+
+- `GET /me/profile` - the caller's own alumni record (404 if the account
+  has no linked alumni record)
+- `PATCH /me/profile` - only `graduation_date`, `graduation_year`,
+  `job_title`, `company`, `job_location`, `city`, `state`, `country`,
+  `linkedin_url`, `bio`, `profile_visibility` may be set; any other field
+  in the request body (e.g. `role`, `verification_status`, `alumni_id`)
+  is rejected with `422`.
+- `POST /me/profile/photo` - multipart image upload (`jpeg`/`png`/`webp`,
+  size-limited by `MAX_UPLOAD_SIZE_MB`); stores only a generated URL on
+  the profile, never a raw filesystem path.
+- `POST /me/legal-name-change-request` - `{ requested_legal_name, reason }`,
+  reviewed later by an admin.
 
 ## 3. Running the automated test suite
 
@@ -217,12 +260,16 @@ python -m pytest tests/ -v
 ```
 
 Tests run against a throwaway SQLite database (configured in
-`tests/conftest.py`) so they don't require Postgres. They cover: login
-success/failure, expired tokens, organization authorization (including
-that a frontend-supplied org slug alone is never trusted), CSV import +
-duplicate prevention, NYC/Brooklyn/state-abbreviation location
-normalization, remote/ambiguous/missing locations, analytics city/metro
-grouping, and dry-run reprocessing.
+`tests/conftest.py`) so they don't require Postgres. Coverage includes:
+login success/failure and JWT claims, organization authorization, CSV
+import creating DB records that are then visible via `GET /alumni-data`,
+admin-created events/speakers/Super Stars appearing in their public GET
+endpoints, alumni being blocked from all `/admin/*` write endpoints,
+persistence across a simulated process restart (fresh DB session/engine,
+no dropped tables), profile view/edit restricted to the caller's own
+record (one alumni cannot edit another's profile), profile photo upload
+validation, the legal-name-change-request approval workflow, and location
+normalization/analytics grouping.
 
 ## 4. Connecting the Lovable frontend
 
@@ -232,13 +279,11 @@ Set an environment variable in your Lovable/Vite project:
 VITE_API_BASE_URL=https://your-deployed-backend.example.com
 ```
 
-Then call:
+Frontend routes and the roles that can reach them:
 
-- `POST {VITE_API_BASE_URL}/login` with `{ username, password }`
-- `GET {VITE_API_BASE_URL}/alumni-data?organization=fsu-cci` with
-  `Authorization: Bearer <access_token>`
-- `GET {VITE_API_BASE_URL}/analytics/summary?organization=fsu-cci` with
-  the same header
+- Alumni: `/dashboard`, `/map`, `/companies`, `/industries`, `/seniority`,
+  `/universities`, `/events`, `/speakers`, `/super-stars`, `/profile`
+- Admin: all of the above, plus management/import/publish/review screens.
 
 Add the frontend's deployed origin (and any Lovable preview domain you
 use) to `ALLOWED_ORIGINS` on the backend.
@@ -256,31 +301,43 @@ use) to `ALLOWED_ORIGINS` on the backend.
 - Set `ENVIRONMENT=production` and `ENABLE_API_DOCS=false`. Startup will
   refuse to boot if `JWT_SECRET_KEY` is weak/default, `ALLOWED_ORIGINS` is
   empty, or `DATABASE_URL` still points at SQLite.
+- Profile photos: `STORAGE_PROVIDER=local` writes to `UPLOADS_DIR` on the
+  server's own disk, which is fine for a single persistent instance but
+  is lost on ephemeral/multi-instance deploys. For those, implement an
+  additional provider (e.g. S3) in `app/services/storage_service.py`
+  behind the same `save_profile_photo()` interface and set
+  `STORAGE_PROVIDER` accordingly - no route code needs to change.
 - Put the service behind HTTPS; point `ALLOWED_ORIGINS` at your production
   Lovable domain.
 
 ## 6. Security notes
 
 - Passwords are bcrypt-hashed (`app/security.py`); plaintext passwords are
-  never stored or logged, and `data/users.csv` is gitignored and
-  `chmod 600`.
-- `data/users.csv` is only ever read/written server-side
-  (`app/csv_user_store.py`, `scripts/create_user.py`) - no route serves
-  its contents, and no response body ever includes a password hash or the
-  file path.
-- JWTs carry `username` (`sub`) and `role` as signed claims; every request
-  is authorized from those claims rather than re-reading the CSV, so a
-  token remains valid (with its role) until it expires even if the CSV
-  changes - re-login (or wait for expiry) after changing a user's role.
-- `/admin/*` routes require the `admin` role.
-- Organization slugs passed via `?organization=` are still validated
-  against the database (404 if unknown) even though CSV users aren't
-  scoped to specific organizations today.
+  never stored, logged, or returned in any response.
+- JWTs carry `sub` (username) and `role`, but authorization always
+  re-checks the live database row for the user (`app/deps.get_current_user`)
+  - a role or profile-link change takes effect on the very next request,
+    not just after the token expires.
+- `/admin/*` write routes, and the write endpoints under `/events`,
+  `/speakers`, `/super-stars`, require `role == "admin"`.
+- `PATCH /me/profile` uses an allow-list schema (`extra="forbid"`) so a
+  request containing `role`, `verification_status`, `alumni_id`, etc. is
+  rejected outright rather than silently ignored.
+- Government ID images are never accepted or stored anywhere in this
+  application; legal name changes go through an admin text-review
+  workflow (`LegalNameChangeRequest`) instead.
+- Profile photo uploads validate content-type, size, and always generate
+  a random server-side filename (no user-supplied filename or path is
+  ever used) - see `app/services/storage_service.py`.
+- Organization slugs passed via `?organization=` are validated against
+  the database (404 if unknown).
 - CORS is restricted to an explicit origin allow-list (`ALLOWED_ORIGINS`),
   never a wildcard.
 - The login endpoint is rate-limited (`LOGIN_RATE_LIMIT`) and always
   performs a bcrypt comparison (even for unknown usernames) to reduce
   timing-based username enumeration.
+- Every admin write (CSV import, content CRUD, legal-name review) is
+  recorded in `audit_logs` in the same transaction as the change itself.
 - Security response headers (`X-Content-Type-Options`, `X-Frame-Options`,
   `Referrer-Policy`) are added to every response.
 
@@ -293,25 +350,20 @@ implementation and doc comments. Key guarantees:
 - NYC boroughs (Brooklyn, Queens, Manhattan, The Bronx, Staten Island)
   keep their own `city` value and are never collapsed into "New York
   City" - but they do share `metro_area = "New York City Metropolitan Area"`.
-  Analytics groups top cities by `(city, state)` and top metro areas by
-  `metro_area` separately, so Brooklyn and New York City are never merged
-  as the same city.
 - Ambiguous input (e.g. a bare "Springfield") is preserved verbatim with
   `location_normalization_status = "ambiguous"` rather than guessed.
 - `Remote` never invents a city/state/country.
 - The `location_aliases` table is checked before generic parsing rules and
-  can be extended without code changes (seed via
-  `app/seed/seed_data.py` / `scripts/seed_organizations.py`).
-- No paid geocoding dependency is required. Optional lat/lng enrichment is
-  gated behind `GEOCODING_ENABLED` and cached in-process; the app fully
-  functions with it disabled (the default).
+  can be extended without code changes.
+- No paid geocoding dependency is required (optional, gated behind
+  `GEOCODING_ENABLED`, off by default).
 
 ## 8. Industry / career category / seniority classification
 
 Imported spreadsheet values always take priority and are tagged
 `industry_source/career_category_source/seniority_source = "imported"`.
 When a field is blank, `app/services/classification_service.py` may infer
-a value from job title/company keywords, tagged `"inferred"`. Analytics
-and any "official" reporting should treat only `imported` and
-`manually_assigned` values as confirmed; the frontend may show `inferred`
-values as a temporary fallback.
+a value from job title/company keywords, tagged `"inferred"`.
+`Company`/`Industry`/`University` reference rows are also opportunistically
+deduplicated per-organization during CSV import to back the
+`/companies`, `/industries`, `/universities` frontend pages.

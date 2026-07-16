@@ -11,7 +11,6 @@ class Organization(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     slug: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
 
-    user_roles = relationship("UserOrganizationRole", back_populates="organization", cascade="all, delete-orphan")
     alumni_links = relationship("AlumniOrganization", back_populates="organization", cascade="all, delete-orphan")
 
     def __repr__(self) -> str:

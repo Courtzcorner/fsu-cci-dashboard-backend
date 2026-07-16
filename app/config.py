@@ -20,8 +20,15 @@ class Settings(BaseSettings):
     # --- Database ---
     database_url: str = "sqlite:///./dev.db"
 
-    # --- Credentials CSV (backend-only, never exposed to the frontend) ---
-    users_csv_path: str = "data/users.csv"
+    # --- File storage (profile photo uploads) ---
+    # "local" stores files under UPLOADS_DIR and serves them from /uploads.
+    # Swap in "s3" (or another provider) later by implementing it in
+    # app/services/storage_service.py behind the same interface - the app
+    # must keep working with "local" and no external credentials.
+    storage_provider: str = "local"
+    uploads_dir: str = "uploads"
+    public_base_url: str = "http://localhost:8000"
+    max_upload_size_mb: int = 5
 
     # --- Security / JWT ---
     jwt_secret_key: str = "insecure-dev-secret-key-change-me"
@@ -58,9 +65,10 @@ class Settings(BaseSettings):
         return self.database_url.startswith("sqlite")
 
     @property
-    def users_csv_full_path(self) -> Path:
-        path = Path(self.users_csv_path)
+    def uploads_dir_full_path(self) -> Path:
+        path = Path(self.uploads_dir)
         return path if path.is_absolute() else BASE_DIR / path
+
 
 
 @lru_cache

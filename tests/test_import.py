@@ -22,7 +22,7 @@ Maria,Gomez,2019,"Tallahassee, FL",,Reporter,WCTV
 """
 
 
-def test_csv_import_creates_records(client, organization, db_session):
+def test_csv_import_creates_records(client, organization, admin_user, db_session):
     token = _login(client, "admin", "AdminPass123!")
     response = _upload(client, token, "fsu-cci", CSV_BASIC)
     assert response.status_code == 200
@@ -41,7 +41,7 @@ def test_csv_import_creates_records(client, organization, db_session):
     assert brooklyn.linkedin_url == "https://linkedin.com/in/jordanlee"
 
 
-def test_csv_import_prevents_duplicates_via_linkedin_url(client, organization, db_session):
+def test_csv_import_prevents_duplicates_via_linkedin_url(client, organization, admin_user, db_session):
     token = _login(client, "admin", "AdminPass123!")
     _upload(client, token, "fsu-cci", CSV_BASIC)
 
@@ -58,7 +58,7 @@ def test_csv_import_prevents_duplicates_via_linkedin_url(client, organization, d
     assert jordan.job_title == "Senior Product Manager"
 
 
-def test_csv_import_does_not_merge_on_name_alone(client, organization, db_session):
+def test_csv_import_does_not_merge_on_name_alone(client, organization, admin_user, db_session):
     token = _login(client, "admin", "AdminPass123!")
     csv_text = (
         "First Name,Last Name,Graduation Year,Location\n"
@@ -78,7 +78,7 @@ def test_csv_import_does_not_merge_on_name_alone(client, organization, db_sessio
     assert len(records) == 2
 
 
-def test_csv_import_reports_row_errors_for_missing_required_fields(client, organization):
+def test_csv_import_reports_row_errors_for_missing_required_fields(client, organization, admin_user):
     token = _login(client, "admin", "AdminPass123!")
     csv_text = "First Name,Last Name\n,\nJordan,Lee\n"
     response = _upload(client, token, "fsu-cci", csv_text)
@@ -88,7 +88,7 @@ def test_csv_import_reports_row_errors_for_missing_required_fields(client, organ
     assert len(body["row_errors"]) == 1
 
 
-def test_csv_import_requires_admin_role(client, organization):
+def test_csv_import_requires_admin_role(client, organization, alumni_user):
     token = _login(client, "jdoe", "AlumniPass123!")
     response = _upload(client, token, "fsu-cci", CSV_BASIC)
     assert response.status_code == 403

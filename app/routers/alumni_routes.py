@@ -16,7 +16,7 @@ router = APIRouter(tags=["alumni"])
 @router.get("/alumni-data", response_model=AlumniListResponse)
 def get_alumni_data(
     page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=200),
+    page_size: int = Query(50, ge=1, le=5000),
     graduation_year: Optional[int] = None,
     major: Optional[str] = None,
     industry: Optional[str] = None,

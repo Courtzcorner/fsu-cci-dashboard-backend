@@ -14,11 +14,14 @@ Responsibilities:
 import csv
 import io
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from app.models.alumni import Alumni, AlumniOrganization
 from app.models.audit import CSVImport
@@ -205,7 +208,9 @@ def import_alumni_csv(
 
     normalized_fieldnames = {original: _normalize_column_name(original) for original in reader.fieldnames}
 
+    rows_parsed = 0
     for row_index, raw_row in enumerate(reader, start=2):  # header is row 1
+        rows_parsed += 1
         try:
             row: dict[str, str | None] = {}
             for original_key, value in raw_row.items():
@@ -347,11 +352,25 @@ def import_alumni_csv(
         db.commit()
     except Exception:
         db.rollback()
+        logger.error(
+            "CSV import FAILED and was rolled back: organization_slug=%s organization_id=%s "
+            "rows_parsed=%s created=%s updated=%s skipped=%s failed=%s transaction_committed=False",
+            organization.slug, organization.id, rows_parsed,
+            summary.created, summary.updated, summary.skipped, summary.failed,
+        )
         raise
 
     # Re-query the database (not in-memory counters) to confirm the import
     # actually persisted, and report the organization's true current total.
     summary.database_total = (
         db.query(AlumniOrganization).filter(AlumniOrganization.organization_id == organization.id).count()
+    )
+
+    logger.info(
+        "CSV import committed: organization_slug=%s organization_id=%s rows_parsed=%s "
+        "created=%s updated=%s skipped=%s failed=%s transaction_committed=True database_total=%s",
+        organization.slug, organization.id, rows_parsed,
+        summary.created, summary.updated, summary.skipped, summary.failed,
+        summary.database_total,
     )
     return summary

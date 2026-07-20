@@ -92,3 +92,39 @@ def test_csv_import_requires_admin_role(client, organization, alumni_user):
     token = _login(client, "jdoe", "AlumniPass123!")
     response = _upload(client, token, "fsu-cci", CSV_BASIC)
     assert response.status_code == 403
+
+
+def test_csv_import_defaults_to_fsu_cci_when_organization_field_is_omitted(client, organization, admin_user):
+    """organization: str = Form(default="fsu-cci") - omitting the form
+    field entirely must still import against fsu-cci, not fail/400."""
+    token = _login(client, "admin", "AdminPass123!")
+    response = client.post(
+        "/admin/import-alumni",
+        # No "organization" key in the form data at all.
+        files={"file": ("alumni.csv", io.BytesIO(CSV_BASIC.encode("utf-8")), "text/csv")},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    assert response.json()["organization"] == "fsu-cci"
+    assert response.json()["created"] == 2
+
+
+def test_csv_import_uses_submitted_organization_when_provided(client, admin_user, db_session):
+    from app.models.organization import Organization
+
+    other_org = Organization(name="STARS National", slug="stars-national")
+    db_session.add(other_org)
+    db_session.commit()
+
+    token = _login(client, "admin", "AdminPass123!")
+    response = _upload(client, token, "stars-national", CSV_BASIC)
+    assert response.status_code == 200
+    assert response.json()["organization"] == "stars-national"
+
+
+def test_csv_import_rejects_unknown_organization_even_with_valid_admin(client, admin_user):
+    """The submitted form field alone never grants access - an admin
+    cannot import into an organization that doesn't exist in the database."""
+    token = _login(client, "admin", "AdminPass123!")
+    response = _upload(client, token, "does-not-exist", CSV_BASIC)
+    assert response.status_code == 404

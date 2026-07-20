@@ -26,6 +26,7 @@ def test_admin_without_alumni_link_gets_404_on_profile(client, admin_user, organ
     token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
     response = client.get("/me/profile", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 404
+    assert response.json() == {"detail": "No alumni profile is linked to this account"}
 
 
 def test_patch_my_profile_updates_allowed_fields(client, alumni_user, alumni_record, organization, db_session):

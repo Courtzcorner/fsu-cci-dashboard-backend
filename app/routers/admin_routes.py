@@ -1,7 +1,10 @@
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from app.database import get_db
 from app.deps import CurrentUser, get_current_user, require_admin_role
@@ -26,28 +29,46 @@ def _resolve_organization(db: Session, slug: str) -> Organization:
 
 @router.post("/import-alumni", response_model=ImportResult)
 async def import_alumni(
-    organization_slug: str = Form(..., alias="organization"),
+    organization: str = Form(default="fsu-cci"),
     file: UploadFile = File(...),
     current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ImportResult:
+    # Admin role is checked first, then the requested organization slug is
+    # authorized/resolved against the database - the submitted form field
+    # alone never grants access to an organization that doesn't exist or
+    # that this deployment doesn't manage.
     require_admin_role(current_user)
-    organization = _resolve_organization(db, organization_slug)
+    organization_record = _resolve_organization(db, organization)
 
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .csv files are accepted")
 
     contents = await file.read()
-    summary = import_alumni_csv(
-        db, organization, contents, imported_by_user_id=current_user.id, filename=file.filename
-    )
+
+    try:
+        summary = import_alumni_csv(
+            db, organization_record, contents, imported_by_user_id=current_user.id, filename=file.filename
+        )
+    except Exception:
+        # import_alumni_csv already rolled back its own transaction on
+        # failure; nothing was committed, so no partial import is visible
+        # to anyone. Never report success for a failed import.
+        logger.exception(
+            "CSV import failed for organization=%s; transaction rolled back", organization_record.slug
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Import failed and was rolled back. No records were changed.",
+        )
 
     return ImportResult(
-        organization=organization.slug,
+        organization=organization_record.slug,
         created=summary.created,
         updated=summary.updated,
         skipped=summary.skipped,
         failed=summary.failed,
+        database_total=summary.database_total,
         row_errors=[RowError(**e) for e in summary.row_errors],
         csv_import_id=summary.csv_import_id,
     )

@@ -5,6 +5,7 @@ All sensitive/environment-specific values are read from environment
 variables (optionally loaded from a local .env file via python-dotenv).
 Nothing sensitive should ever be hard-coded here.
 """
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import List
@@ -13,12 +14,24 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Render sets these on every service automatically - used to force
+# production-grade validation (real Postgres, strong secret, explicit
+# CORS origins) even if ENVIRONMENT was left unset/misconfigured on the
+# dashboard. This is what previously allowed the app to silently boot
+# against an ephemeral local SQLite file on Render and lose all imported
+# data on every restart/redeploy/scale-to-zero.
+_RENDER_ENV_MARKERS = ("RENDER", "RENDER_SERVICE_ID", "RENDER_INSTANCE_ID")
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # --- Database ---
-    database_url: str = "sqlite:///./dev.db"
+    # No default on purpose: DATABASE_URL must always be explicitly set
+    # (via .env locally, or a real Render env var in production). If it's
+    # missing, the app must fail to start rather than silently falling
+    # back to a local SQLite file that disappears on every restart.
+    database_url: str
 
     # --- File storage (profile photo uploads) ---
     # "local" stores files under UPLOADS_DIR and serves them from /uploads.
@@ -53,8 +66,15 @@ class Settings(BaseSettings):
     geocoding_provider_api_key: str = ""
 
     @property
+    def is_render(self) -> bool:
+        return any(os.environ.get(marker) for marker in _RENDER_ENV_MARKERS)
+
+    @property
     def is_production(self) -> bool:
-        return self.environment.lower() in {"production", "prod"}
+        # Treated as production if explicitly configured OR if we detect
+        # we're running on Render at all - a Render deployment should
+        # never be allowed to quietly behave like a dev sandbox.
+        return self.environment.lower() in {"production", "prod"} or self.is_render
 
     @property
     def cors_origins_list(self) -> List[str]:
@@ -77,7 +97,8 @@ def get_settings() -> Settings:
 
 
 def validate_settings_for_production(settings: Settings) -> None:
-    """Fail fast if production is misconfigured with insecure defaults."""
+    """Fail fast if production (including any detected Render deployment)
+    is misconfigured with insecure or non-persistent defaults."""
     if not settings.is_production:
         return
 
@@ -93,4 +114,12 @@ def validate_settings_for_production(settings: Settings) -> None:
         )
 
     if settings.is_sqlite:
-        raise RuntimeError("DATABASE_URL must point at PostgreSQL in production, not SQLite.")
+        raise RuntimeError(
+            "DATABASE_URL must point at PostgreSQL in production, not SQLite. "
+            "On Render this almost always means the DATABASE_URL environment "
+            "variable was never set on the service (or was set on the wrong "
+            "service) - imported data will be lost on every restart/redeploy "
+            "until this is fixed. Set DATABASE_URL to your Render Postgres "
+            "instance's 'Internal Database URL' (or 'External Database URL' "
+            "if connecting from outside Render)."
+        )

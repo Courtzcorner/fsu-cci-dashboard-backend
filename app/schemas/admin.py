@@ -12,6 +12,10 @@ class ImportResult(BaseModel):
     updated: int
     skipped: int
     failed: int
+    # True count of this organization's alumni rows in the database,
+    # re-queried after commit - not an in-memory counter - so a caller
+    # can independently confirm the import actually persisted.
+    database_total: int
     row_errors: list[RowError]
     csv_import_id: str | None = None
 

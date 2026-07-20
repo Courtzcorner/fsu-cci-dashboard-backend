@@ -94,6 +94,6 @@ def require_alumni_profile(current_user: CurrentUser) -> str:
     if not current_user.alumni_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="This account has no associated alumni profile",
+            detail="No alumni profile is linked to this account",
         )
     return current_user.alumni_id

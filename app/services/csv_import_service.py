@@ -124,6 +124,7 @@ class ImportSummary:
     failed: int = 0
     row_errors: list[dict] = field(default_factory=list)
     csv_import_id: str | None = None
+    database_total: int = 0
 
 
 def _find_existing_alumni(
@@ -309,34 +310,48 @@ def import_alumni_csv(
             summary.failed += 1
             summary.row_errors.append({"row": row_index, "error": str(exc)})
 
-    csv_import_record = CSVImport(
-        organization_id=organization.id,
-        filename=filename,
-        created_count=summary.created,
-        updated_count=summary.updated,
-        skipped_count=summary.skipped,
-        failed_count=summary.failed,
-        row_errors_json=json.dumps(summary.row_errors) if summary.row_errors else None,
-        imported_by_user_id=imported_by_user_id,
-    )
-    db.add(csv_import_record)
-    db.flush()
-    summary.csv_import_id = csv_import_record.id
+    try:
+        csv_import_record = CSVImport(
+            organization_id=organization.id,
+            filename=filename,
+            created_count=summary.created,
+            updated_count=summary.updated,
+            skipped_count=summary.skipped,
+            failed_count=summary.failed,
+            row_errors_json=json.dumps(summary.row_errors) if summary.row_errors else None,
+            imported_by_user_id=imported_by_user_id,
+        )
+        db.add(csv_import_record)
+        db.flush()
+        summary.csv_import_id = csv_import_record.id
 
-    record_audit_log(
-        db,
-        user_id=imported_by_user_id,
-        action="import",
-        entity_type="csv_import",
-        entity_id=csv_import_record.id,
-        organization_id=organization.id,
-        details={
-            "created": summary.created,
-            "updated": summary.updated,
-            "failed": summary.failed,
-            "filename": filename,
-        },
-    )
+        record_audit_log(
+            db,
+            user_id=imported_by_user_id,
+            action="import",
+            entity_type="csv_import",
+            entity_id=csv_import_record.id,
+            organization_id=organization.id,
+            details={
+                "created": summary.created,
+                "updated": summary.updated,
+                "failed": summary.failed,
+                "filename": filename,
+            },
+        )
 
-    db.commit()
+        # The whole import (every row change + the CSVImport/AuditLog rows)
+        # is committed as a single transaction. If the commit itself fails
+        # for any reason, the transaction is rolled back so we never report
+        # success for a partially-applied import.
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    # Re-query the database (not in-memory counters) to confirm the import
+    # actually persisted, and report the organization's true current total.
+    summary.database_total = (
+        db.query(AlumniOrganization).filter(AlumniOrganization.organization_id == organization.id).count()
+    )
     return summary

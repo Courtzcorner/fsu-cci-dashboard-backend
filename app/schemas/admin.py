@@ -19,10 +19,6 @@ class ImportResult(BaseModel):
     row_errors: list[RowError]
     csv_import_id: str | None = None
 
-
-class NormalizeLocationsResult(BaseModel):
-    organization: str | None
-    processed: int
-    updated: int
-    unchanged: int
-    dry_run: bool
+    # --- Temporary CSV-mapping diagnostics ---
+    # These make it possible to see, directly from the import response,
+    # whether the uploaded

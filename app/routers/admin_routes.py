@@ -71,6 +71,16 @@ async def import_alumni(
         database_total=summary.database_total,
         row_errors=[RowError(**e) for e in summary.row_errors],
         csv_import_id=summary.csv_import_id,
+        recognized_headers=summary.recognized_headers,
+        unrecognized_headers=summary.unrecognized_headers,
+        rows_with_graduation_year=summary.rows_with_graduation_year,
+        rows_with_major=summary.rows_with_major,
+        rows_with_university=summary.rows_with_university,
+        rows_with_job_title=summary.rows_with_job_title,
+        rows_with_company=summary.rows_with_company,
+        rows_with_location=summary.rows_with_location,
+        rows_with_city=summary.rows_with_city,
+        rows_with_state=summary.rows_with_state,
     )
 
 
@@ -171,20 +181,4 @@ def reject_legal_name_request(
     db: Session = Depends(get_db),
 ) -> LegalNameChangeRequest:
     require_admin_role(current_user)
-    request = _resolve_pending_request(db, request_id)
-
-    alumni = db.get(Alumni, request.alumni_id)
-    if alumni is not None:
-        alumni.legal_name_verification_status = "rejected"
-
-    request.status = "rejected"
-    request.reviewed_by_user_id = current_user.id
-    request.reviewed_at = datetime.now(timezone.utc)
-
-    record_audit_log(
-        db, user_id=current_user.id, action="reject", entity_type="legal_name_change_request",
-        entity_id=request.id, details={"alumni_id": request.alumni_id},
-    )
-    db.commit()
-    db.refresh(request)
-    return request
+    request = _resolve_pendi

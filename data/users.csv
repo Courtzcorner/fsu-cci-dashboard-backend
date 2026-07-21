@@ -1,3 +1,0 @@
-username,password_hash,role
-admin,$2b$12$HASHED_PASSWORD_HERE,admin
-courtney,$2b$12$HASHED_PASSWORD_HERE,alumni

@@ -2,14 +2,21 @@
 CSV import pipeline for alumni records, scoped to a single organization.
 
 Responsibilities:
-- normalize column names / whitespace / blank -> null
+- normalize arbitrary spreadsheet column headers (via `normalize_header`)
+  and map them to canonical Alumni fields (via `FIELD_ALIASES`)
+- normalize whitespace / blank -> null, preserving 0 and False
 - preserve `location_original` and normalize location via
-  `location_normalization_service`
+  `location_normalization_service` (only once `location_original` is
+  actually populated)
 - normalize LinkedIn URLs
 - parse graduation years
 - validate required fields
 - detect + update duplicates (never merge purely on name)
-- return created/updated/skipped/failed counts and row-specific errors
+- on update, never overwrite an existing nonnull database value with a
+  blank CSV value ("safe update")
+- return created/updated/skipped/failed counts, row-specific errors, and
+  temporary import diagnostics (recognized/unrecognized headers, per-field
+  fill counts) to make CSV mapping issues visible without a debugger
 """
 import csv
 import io
@@ -21,8 +28,6 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-logger = logging.getLogger(__name__)
-
 from app.models.alumni import Alumni, AlumniOrganization
 from app.models.audit import CSVImport
 from app.models.organization import Organization
@@ -31,56 +36,132 @@ from app.services.audit_service import record_audit_log
 from app.services.classification_service import classify_alumni_fields
 from app.services.location_normalization_service import normalize_location
 
+logger = logging.getLogger(__name__)
+
 REQUIRED_FIELDS = {"first_name", "last_name"}
 
-# Accepts common header variants and maps them to our canonical column
-# names. Matching is done after lowercasing + stripping punctuation/spaces.
-COLUMN_ALIASES: dict[str, str] = {
-    "firstname": "first_name",
-    "first": "first_name",
-    "lastname": "last_name",
-    "last": "last_name",
-    "fullname": "full_name",
-    "name": "full_name",
-    "gradyear": "graduation_year",
-    "graduationyear": "graduation_year",
-    "classyear": "graduation_year",
-    "major": "major",
-    "degree": "degree",
-    "university": "university",
-    "school": "university",
-    "jobtitle": "job_title",
-    "title": "job_title",
-    "position": "job_title",
-    "company": "company",
-    "employer": "company",
-    "industry": "industry",
-    "careercategory": "career_category",
-    "career": "career_category",
-    "seniority": "seniority",
-    "seniority level": "seniority",
-    "seniioritylevel": "seniority",
-    "location": "location_original",
-    "city_state": "location_original",
-    "linkedin": "linkedin_url",
-    "linkedinurl": "linkedin_url",
-    "linkedinprofile": "linkedin_url",
-    "verified": "verified",
-    "email": "email",
+# Values that mean "no data" once trimmed + lowercased. Zero and False are
+# intentionally NOT in this set - they are meaningful values, not blanks.
+_NULL_TOKENS = {"", "null", "none", "nan", "n/a"}
+
+FSU_CCI_SLUG = "fsu-cci"
+FSU_CCI_DEFAULT_UNIVERSITY = "Florida State University"
+
+
+def normalize_header(header: str) -> str:
+    """Turn an arbitrary spreadsheet header into a canonical snake_case
+    token, e.g. "Current Job Title" -> "current_job_title".
+
+    Handles: leading/trailing whitespace, UTF-8 BOM, non-breaking/hidden
+    whitespace, casing, spaces/hyphens -> underscore, punctuation removal,
+    and duplicate/leading/trailing underscore collapsing.
+    """
+    if header is None:
+        return ""
+    text = header.replace("\ufeff", "")  # UTF-8 BOM, in case it wasn't already stripped
+    text = text.replace("\xa0", " ")  # non-breaking space
+    text = text.strip()
+    text = text.lower()
+    text = text.replace("-", "_")
+    text = re.sub(r"\s+", "_", text)  # any whitespace run (space/tab/newline) -> underscore
+    text = re.sub(r"[^a-z0-9_]", "", text)  # drop punctuation (periods, slashes, parens, apostrophes, ...)
+    text = re.sub(r"_+", "_", text)  # collapse duplicate underscores
+    return text.strip("_")
+
+
+# Explicit alias map: canonical Alumni-import field -> ordered list of
+# normalize_header() outputs, in PRIORITY order. When a CSV happens to
+# contain more than one column that maps to the same field (e.g. both
+# "Current Job Title" and "LinkedIn Job Title"), the first nonblank value
+# found in this priority order wins.
+FIELD_ALIASES: dict[str, list[str]] = {
+    "graduation_year": [
+        "graduation_year", "grad_year", "graduation_date", "graduation", "class_year", "year_graduated",
+    ],
+    "major": [
+        "major", "major_name", "program", "program_of_study", "field_of_study", "area_of_study",
+    ],
+    "degree": [
+        "degree", "degree_name", "degree_type", "education", "credential",
+    ],
+    "university": [
+        "university", "school", "school_name", "college", "institution", "institution_name",
+        "education_school",
+    ],
+    # Explicit priority per spec: LinkedIn-sourced value first, then
+    # "current", then the plain/generic column, then "existing" last.
+    "job_title": [
+        "linkedin_job_title", "current_job_title", "job_title", "title", "current_title",
+        "position", "current_position", "existing_job_title",
+    ],
+    "company": [
+        "linkedin_company", "current_employer", "current_company", "company", "company_name",
+        "employer", "organization", "existing_company",
+    ],
+    "industry": [
+        "industry", "current_industry", "career_industry",
+    ],
+    "career_category": [
+        "career_category", "career_field", "job_category", "career_path", "functional_area",
+    ],
+    "seniority": [
+        "seniority", "seniority_level", "career_level", "job_level", "level",
+    ],
+    "location_original": [
+        "linkedin_location", "current_location", "job_location", "location", "raw_location",
+        "address", "city_state", "existing_location",
+    ],
+    "city": ["city", "current_city", "job_city"],
+    "state": ["state", "current_state", "job_state"],
+    "state_code": ["state_code", "state_abbreviation", "state_abbrev"],
+    "country": ["country", "current_country", "job_country"],
+    "metro_area": ["metro_area", "metropolitan_area", "metro", "region"],
+    "display_location": ["display_location", "formatted_location", "location_display"],
+    "linkedin_url": ["linkedin_url", "linkedin", "linkedin_profile", "profile_url"],
+    "first_name": ["first_name", "firstname", "first", "student_firstname", "student_first_name"],
+    "last_name": ["last_name", "lastname", "last", "student_lastname", "student_last_name"],
+    "full_name": ["full_name", "name", "student_name", "alumni_name"],
+    "verification_status": ["verification_status", "verified_status", "education_match_status"],
+    "verified": ["verified", "is_verified"],
+    # Recognized (won't be flagged as "unrecognized") but not yet persisted
+    # to an Alumni column - no schema field exists for these today.
+    "profile_headline": ["profile_headline", "headline", "linkedin_headline"],
+    "employment_tenure": ["employment_tenure", "tenure"],
+    "employment_type": ["employment_type", "job_type"],
+    "email": ["email"],
 }
 
+# Note: "profile_headline", "employment_tenure", "employment_type", and
+# "email" are recognized (won't show up as unrecognized_headers) but have
+# no backing Alumni column yet, so they are intentionally never added to
+# field_values below.
 
-def _normalize_column_name(raw: str) -> str:
-    key = raw.strip().lower()
-    key = re.sub(r"[\s_\-]+", "", key)
-    return COLUMN_ALIASES.get(key, re.sub(r"[\s\-]+", "_", raw.strip().lower()))
+# Reverse lookup: normalized header alias -> canonical field name. Used to
+# classify each incoming CSV header as recognized/unrecognized.
+ALIAS_TO_FIELD: dict[str, str] = {}
+for _field_name, _aliases in FIELD_ALIASES.items():
+    for _alias in _aliases:
+        ALIAS_TO_FIELD.setdefault(_alias, _field_name)
 
 
 def _clean_value(value: str | None) -> str | None:
+    """Trim whitespace and convert blank/NaN/null-ish tokens to None.
+    Never touches a genuinely meaningful value (e.g. "0", "false", "No").
+    """
     if value is None:
         return None
     stripped = value.strip()
-    return stripped if stripped else None
+    if stripped.lower() in _NULL_TOKENS:
+        return None
+    return stripped
+
+
+def _first_nonblank(row_by_alias: dict[str, str | None], aliases: list[str]) -> str | None:
+    for alias in aliases:
+        value = row_by_alias.get(alias)
+        if value is not None:
+            return value
+    return None
 
 
 def _normalize_linkedin_url(value: str | None) -> str | None:
@@ -128,6 +209,17 @@ class ImportSummary:
     row_errors: list[dict] = field(default_factory=list)
     csv_import_id: str | None = None
     database_total: int = 0
+    # --- Temporary diagnostics (see admin_routes/ImportResult) ---
+    recognized_headers: list[str] = field(default_factory=list)
+    unrecognized_headers: list[str] = field(default_factory=list)
+    rows_with_graduation_year: int = 0
+    rows_with_major: int = 0
+    rows_with_university: int = 0
+    rows_with_job_title: int = 0
+    rows_with_company: int = 0
+    rows_with_location: int = 0
+    rows_with_city: int = 0
+    rows_with_state: int = 0
 
 
 def _find_existing_alumni(
@@ -180,12 +272,12 @@ def _get_or_create_reference(db: Session, model, organization_id: str, name: str
     cache[key] = True
 
 
-def _compute_profile_completion(row: dict) -> int:
+def _compute_profile_completion(effective: dict) -> int:
     tracked_fields = [
         "job_title", "company", "industry", "major", "degree", "university",
         "location_original", "linkedin_url", "graduation_year",
     ]
-    filled = sum(1 for f in tracked_fields if row.get(f))
+    filled = sum(1 for f in tracked_fields if effective.get(f))
     return round((filled / len(tracked_fields)) * 100)
 
 
@@ -206,25 +298,58 @@ def import_alumni_csv(
         summary.row_errors.append({"row": 0, "error": "CSV file has no header row"})
         return summary
 
-    normalized_fieldnames = {original: _normalize_column_name(original) for original in reader.fieldnames}
+    original_headers = list(reader.fieldnames)
+    # original header -> normalized alias string (e.g. "Current Job Title" -> "current_job_title")
+    header_to_normalized = {h: normalize_header(h) for h in original_headers}
+    # normalized alias string -> canonical field (only for recognized aliases)
+    header_to_field = {h: ALIAS_TO_FIELD.get(norm) for h, norm in header_to_normalized.items()}
+
+    recognized_headers = [h for h, f_ in header_to_field.items() if f_ is not None]
+    unrecognized_headers = [h for h, f_ in header_to_field.items() if f_ is None]
+    summary.recognized_headers = recognized_headers
+    summary.unrecognized_headers = unrecognized_headers
+
+    logger.info(
+        "CSV import header inspection: original_headers=%s normalized_headers=%s "
+        "recognized=%s unrecognized=%s",
+        original_headers, list(header_to_normalized.values()), recognized_headers, unrecognized_headers,
+    )
 
     rows_parsed = 0
     for row_index, raw_row in enumerate(reader, start=2):  # header is row 1
         rows_parsed += 1
         try:
-            row: dict[str, str | None] = {}
+            # Keyed by normalized alias string (NOT canonical field) so that
+            # multiple columns mapping to the same field can be prioritized
+            # correctly instead of silently overwriting one another.
+            row_by_alias: dict[str, str | None] = {}
             for original_key, value in raw_row.items():
                 if original_key is None:
                     continue
-                canonical_key = normalized_fieldnames.get(original_key, original_key)
-                row[canonical_key] = _clean_value(value)
+                alias = header_to_normalized.get(original_key, normalize_header(original_key))
+                cleaned = _clean_value(value)
+                # Keep the first nonblank value seen for a given alias key
+                # (duplicate header names in a CSV are rare but possible).
+                if alias not in row_by_alias or row_by_alias[alias] is None:
+                    row_by_alias[alias] = cleaned
 
-            first_name = row.get("first_name")
-            last_name = row.get("last_name")
-            full_name = row.get("full_name")
+            resolved: dict[str, str | None] = {
+                field_name: _first_nonblank(row_by_alias, aliases) for field_name, aliases in FIELD_ALIASES.items()
+            }
 
-            if (not first_name or not last_name) and full_name:
-                parts = full_name.split(" ", 1)
+            if row_index == 2:
+                logger.info(
+                    "CSV import first-row inspection: raw_row=%s resolved_fields=%s",
+                    {k: v for k, v in raw_row.items() if k is not None},
+                    resolved,
+                )
+
+            first_name = resolved.get("first_name")
+            last_name = resolved.get("last_name")
+            full_name_raw = resolved.get("full_name")
+
+            if (not first_name or not last_name) and full_name_raw:
+                parts = full_name_raw.split(" ", 1)
                 first_name = first_name or parts[0]
                 last_name = last_name or (parts[1] if len(parts) > 1 else "")
 
@@ -235,54 +360,105 @@ def import_alumni_csv(
                 )
                 continue
 
-            full_name = full_name or f"{first_name} {last_name}".strip()
+            full_name = full_name_raw or f"{first_name} {last_name}".strip()
 
-            graduation_year, grad_year_error = _parse_graduation_year(row.get("graduation_year"))
+            graduation_year, grad_year_error = _parse_graduation_year(resolved.get("graduation_year"))
             if grad_year_error:
                 summary.row_errors.append({"row": row_index, "error": grad_year_error})
 
-            linkedin_url = _normalize_linkedin_url(row.get("linkedin_url"))
-            location_original = row.get("location_original")
-            location_result = normalize_location(location_original, db=db)
+            linkedin_url = _normalize_linkedin_url(resolved.get("linkedin_url"))
+
+            # Location normalization only ever runs once location_original
+            # is actually populated - never on a blank value.
+            location_original = resolved.get("location_original")
+            location_fields: dict = {}
+            if location_original:
+                location_result = normalize_location(location_original, db=db)
+                location_fields = location_result.as_dict()
+
+            job_title = resolved.get("job_title")
+            company = resolved.get("company")
 
             classification = classify_alumni_fields(
-                job_title=row.get("job_title"),
-                company=row.get("company"),
-                existing_industry=row.get("industry"),
-                existing_career_category=row.get("career_category"),
-                existing_seniority=row.get("seniority"),
+                job_title=job_title,
+                company=company,
+                existing_industry=resolved.get("industry"),
+                existing_career_category=resolved.get("career_category"),
+                existing_seniority=resolved.get("seniority"),
             )
+            # Only keep classification keys that actually resolved to a
+            # nonblank value - a miss (None) must never overwrite an
+            # existing DB value on update.
+            classification = {k: v for k, v in classification.items() if v is not None}
 
-            verified = _parse_bool(row.get("verified"))
+            university_raw = resolved.get("university")
+
+            raw_verified = resolved.get("verified")
+            raw_verification_status = resolved.get("verification_status")
 
             existing = _find_existing_alumni(
                 db,
                 organization_id=organization.id,
                 linkedin_url=linkedin_url,
-                email=row.get("email"),
+                email=resolved.get("email"),
                 first_name=first_name,
                 last_name=last_name,
                 graduation_year=graduation_year,
             )
 
-            field_values = dict(
-                first_name=first_name,
-                last_name=last_name,
-                full_name=full_name,
-                graduation_year=graduation_year,
-                major=row.get("major"),
-                degree=row.get("degree"),
-                university=row.get("university"),
-                job_title=row.get("job_title"),
-                company=row.get("company"),
-                linkedin_url=linkedin_url,
-                verified=verified,
-                verification_status="verified" if verified else "unverified",
-                verification_date=datetime.now(timezone.utc).date() if verified else None,
-                **classification,
-                **location_result.as_dict(),
-            )
-            field_values["profile_completion"] = _compute_profile_completion(field_values)
+            # field_values only ever contains keys we actually want to
+            # write. Blank/unresolved fields are omitted entirely so that
+            # (a) on update, the existing nonnull DB value is preserved,
+            # and (b) on create, the Alumni model's own column defaults
+            # apply (e.g. verification_status="unverified", location
+            # status="missing").
+            field_values: dict = {
+                "first_name": first_name,
+                "last_name": last_name,
+                "full_name": full_name,
+            }
+            if graduation_year is not None:
+                field_values["graduation_year"] = graduation_year
+            if resolved.get("major"):
+                field_values["major"] = resolved["major"]
+            if resolved.get("degree"):
+                field_values["degree"] = resolved["degree"]
+            if job_title:
+                field_values["job_title"] = job_title
+            if company:
+                field_values["company"] = company
+            if linkedin_url:
+                field_values["linkedin_url"] = linkedin_url
+            field_values.update(location_fields)
+            field_values.update(classification)
+
+            # University: nonblank CSV value always wins. If blank, apply
+            # the fsu-cci-only default, but ONLY to fill a genuine gap
+            # (never overwrite an existing nonnull DB value on update).
+            if university_raw:
+                field_values["university"] = university_raw
+            elif organization.slug == FSU_CCI_SLUG and (existing is None or not existing.university):
+                field_values["university"] = FSU_CCI_DEFAULT_UNIVERSITY
+
+            if raw_verified is not None:
+                verified_bool = _parse_bool(raw_verified)
+                field_values["verified"] = verified_bool
+                field_values["verification_date"] = datetime.now(timezone.utc).date() if verified_bool else None
+                field_values["verification_status"] = raw_verification_status or (
+                    "verified" if verified_bool else "unverified"
+                )
+            elif raw_verification_status is not None:
+                field_values["verification_status"] = raw_verification_status
+
+            tracked_fields = [
+                "job_title", "company", "industry", "major", "degree", "university",
+                "location_original", "linkedin_url", "graduation_year",
+            ]
+            if existing:
+                effective = {f: field_values.get(f, getattr(existing, f, None)) for f in tracked_fields}
+            else:
+                effective = {f: field_values.get(f) for f in tracked_fields}
+            field_values["profile_completion"] = _compute_profile_completion(effective)
 
             if existing:
                 for key, value in field_values.items():
@@ -297,9 +473,29 @@ def import_alumni_csv(
                 summary.created += 1
                 alumni_id = alumni.id
 
-            _get_or_create_reference(db, Company, organization.id, row.get("company"), reference_cache)
+            if row_index == 2:
+                logger.info("CSV import first-row mapped Alumni fields: %s", field_values)
+
+            if graduation_year is not None:
+                summary.rows_with_graduation_year += 1
+            if resolved.get("major"):
+                summary.rows_with_major += 1
+            if field_values.get("university"):
+                summary.rows_with_university += 1
+            if job_title:
+                summary.rows_with_job_title += 1
+            if company:
+                summary.rows_with_company += 1
+            if location_original:
+                summary.rows_with_location += 1
+            if location_fields.get("city"):
+                summary.rows_with_city += 1
+            if location_fields.get("state"):
+                summary.rows_with_state += 1
+
+            _get_or_create_reference(db, Company, organization.id, company, reference_cache)
             _get_or_create_reference(db, Industry, organization.id, field_values.get("industry"), reference_cache)
-            _get_or_create_reference(db, University, organization.id, row.get("university"), reference_cache)
+            _get_or_create_reference(db, University, organization.id, field_values.get("university"), reference_cache)
 
             record_audit_log(
                 db,
@@ -368,9 +564,11 @@ def import_alumni_csv(
 
     logger.info(
         "CSV import committed: organization_slug=%s organization_id=%s rows_parsed=%s "
-        "created=%s updated=%s skipped=%s failed=%s transaction_committed=True database_total=%s",
+        "created=%s updated=%s skipped=%s failed=%s transaction_committed=True database_total=%s "
+        "rows_with_university=%s rows_with_job_title=%s rows_with_company=%s rows_with_location=%s",
         organization.slug, organization.id, rows_parsed,
         summary.created, summary.updated, summary.skipped, summary.failed,
-        summary.database_total,
+        summary.database_total, summary.rows_with_university, summary.rows_with_job_title,
+        summary.rows_with_company, summary.rows_with_location,
     )
     return summary

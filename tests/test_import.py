@@ -128,3 +128,155 @@ def test_csv_import_rejects_unknown_organization_even_with_valid_admin(client, a
     token = _login(client, "admin", "AdminPass123!")
     response = _upload(client, token, "does-not-exist", CSV_BASIC)
     assert response.status_code == 404
+
+
+# --- Real-world header mapping (School Name, Current Job Title, etc.) ---
+
+# Mirrors the headers actually seen in the real fsu-cci alumni spreadsheet.
+# Includes duplicate-concept columns (Current/Existing/LinkedIn variants)
+# to exercise the priority-ordered alias resolution.
+CSV_REAL_HEADERS = (
+    "First Name,Last Name,Graduation Year,School Name,Degree,Major,"
+    "Current Job Title,Current Employer,Location,Industry,LinkedIn URL,"
+    "Existing Job Title,Existing Company,Existing Location,"
+    "LinkedIn Job Title,LinkedIn Company,LinkedIn Location\n"
+    'Taylor,Reed,2021,,B.A.,Communications,'
+    "Fallback Title,Fallback Co,\"Fallback City, GA\",Media,"
+    "linkedin.com/in/taylorreed,"
+    "Existing Title,Existing Co,\"Existing City, TX\","
+    "Senior Editor,Warner Media,\"Atlanta, GA\"\n"
+)
+
+
+def test_csv_import_maps_real_world_headers_and_prefers_linkedin_columns(
+    client, organization, admin_user, db_session
+):
+    """School Name/Current Job Title/etc. must map to the correct Alumni
+    columns, and when multiple synonymous columns are present, the
+    LinkedIn-sourced value must win per the documented priority order."""
+    token = _login(client, "admin", "AdminPass123!")
+    response = _upload(client, token, "fsu-cci", CSV_REAL_HEADERS)
+    assert response.status_code == 200, response.text
+
+    body = response.json()
+    assert body["created"] == 1
+    assert body["failed"] == 0
+    # "School Name" was blank in this row, so the fsu-cci default applies.
+    assert body["rows_with_university"] == 1
+    assert body["rows_with_job_title"] == 1
+    assert body["rows_with_company"] == 1
+    assert body["rows_with_location"] == 1
+    assert body["unrecognized_headers"] == []
+
+    record = db_session.query(Alumni).filter(Alumni.first_name == "Taylor").one()
+    assert record.university == "Florida State University"
+    assert record.degree == "B.A."
+    assert record.major == "Communications"
+    # LinkedIn columns take priority over Current/Existing/plain columns.
+    assert record.job_title == "Senior Editor"
+    assert record.company == "Warner Media"
+    assert record.location_original == "Atlanta, GA"
+    assert record.city == "Atlanta"
+    assert record.state == "Georgia"
+    # "Industry" was explicitly provided in the CSV, so the imported value
+    # wins over any keyword-based inference.
+    assert record.industry == "Media"
+    assert record.linkedin_url == "https://linkedin.com/in/taylorreed"
+
+
+def test_csv_import_get_alumni_data_returns_nonnull_fields(client, organization, admin_user, db_session):
+    """Regression guard for the reported bug: GET /alumni-data must not
+    come back with nulls for fields the CSV clearly provided."""
+    token = _login(client, "admin", "AdminPass123!")
+    _upload(client, token, "fsu-cci", CSV_REAL_HEADERS)
+
+    response = client.get("/alumni-data", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    records = response.json()["data"]
+    assert len(records) == 1
+    record = records[0]
+    for key in (
+        "graduation_year", "major", "degree", "university", "job_title", "company",
+        "industry", "location_original", "city", "state", "state_code", "country",
+        "display_location",
+    ):
+        assert record[key] is not None, f"{key} unexpectedly null: {record}"
+
+
+def test_csv_import_does_not_erase_existing_values_with_blank_reimport(
+    client, organization, admin_user, db_session
+):
+    """Regression: reimporting a row whose CSV values are now blank must
+    never wipe out previously-populated nonnull database values."""
+    token = _login(client, "admin", "AdminPass123!")
+    full_csv = (
+        "First Name,Last Name,Graduation Year,Current Job Title,Current Employer,Location\n"
+        'Morgan,Blake,2020,Data Analyst,Acme Corp,"Atlanta, GA"\n'
+    )
+    _upload(client, token, "fsu-cci", full_csv)
+
+    record = db_session.query(Alumni).filter(Alumni.first_name == "Morgan").one()
+    assert record.job_title == "Data Analyst"
+    assert record.company == "Acme Corp"
+    assert record.location_original == "Atlanta, GA"
+
+    blank_followup_csv = (
+        "First Name,Last Name,Graduation Year,Current Job Title,Current Employer,Location\n"
+        "Morgan,Blake,2020,,,\n"
+    )
+    response = _upload(client, token, "fsu-cci", blank_followup_csv)
+    assert response.status_code == 200
+    assert response.json()["updated"] == 1
+
+    db_session.expire_all()
+    record = db_session.query(Alumni).filter(Alumni.first_name == "Morgan").one()
+    assert record.job_title == "Data Analyst"
+    assert record.company == "Acme Corp"
+    assert record.location_original == "Atlanta, GA"
+    assert record.city == "Atlanta"
+
+
+def test_reimporting_same_file_fills_previously_null_fields_without_duplicating(
+    client, organization, admin_user, db_session
+):
+    """Simulates the "header-mapping bug fixed, now backfill" flow: the
+    same physical row, first imported with headers the old importer could
+    not map (so most fields end up null), then reimported unchanged once
+    mapping works - must fill the nulls and must not create a duplicate."""
+    token = _login(client, "admin", "AdminPass123!")
+
+    unmapped_csv = (
+        "First Name,Last Name,Graduation Year,Some Unmapped Column\n"
+        "Casey,Nguyen,2018,ignore-me\n"
+    )
+    response = _upload(client, token, "fsu-cci", unmapped_csv)
+    assert response.json()["created"] == 1
+    db_session.expire_all()
+    record = db_session.query(Alumni).filter(Alumni.first_name == "Casey").one()
+    assert record.job_title is None
+    assert record.company is None
+
+    real_csv = (
+        "First Name,Last Name,Graduation Year,Current Job Title,Current Employer,Location\n"
+        'Casey,Nguyen,2018,Software Engineer,Globex,"Miami, FL"\n'
+    )
+    response = _upload(client, token, "fsu-cci", real_csv)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["created"] == 0
+    assert body["updated"] == 1
+
+    db_session.expire_all()
+    records = db_session.query(Alumni).filter(Alumni.first_name == "Casey").all()
+    assert len(records) == 1
+    record = records[0]
+    assert record.job_title == "Software Engineer"
+    assert record.company == "Globex"
+    assert record.city == "Miami"
+
+    # Reimporting the exact same file again must not duplicate or regress.
+    response = _upload(client, token, "fsu-cci", real_csv)
+    assert response.json()["updated"] == 1
+    db_session.expire_all()
+    records = db_session.query(Alumni).filter(Alumni.first_name == "Casey").all()
+    assert len(records) == 1

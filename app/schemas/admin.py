@@ -21,4 +21,24 @@ class ImportResult(BaseModel):
 
     # --- Temporary CSV-mapping diagnostics ---
     # These make it possible to see, directly from the import response,
-    # whether the uploaded
+    # whether the uploaded spreadsheet's headers were actually recognized
+    # and how many rows ended up with each key field populated. Safe to
+    # remove once header-mapping issues are no longer a concern.
+    recognized_headers: list[str] = []
+    unrecognized_headers: list[str] = []
+    rows_with_graduation_year: int = 0
+    rows_with_major: int = 0
+    rows_with_university: int = 0
+    rows_with_job_title: int = 0
+    rows_with_company: int = 0
+    rows_with_location: int = 0
+    rows_with_city: int = 0
+    rows_with_state: int = 0
+
+
+class NormalizeLocationsResult(BaseModel):
+    organization: str | None
+    processed: int
+    updated: int
+    unchanged: int
+    dry_run: bool

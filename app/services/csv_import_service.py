@@ -42,7 +42,16 @@ REQUIRED_FIELDS = {"first_name", "last_name"}
 
 # Values that mean "no data" once trimmed + lowercased. Zero and False are
 # intentionally NOT in this set - they are meaningful values, not blanks.
-_NULL_TOKENS = {"", "null", "none", "nan", "n/a"}
+_NULL_TOKENS = {"", "null", "none", "nan", "n/a", "na", "-"}
+
+# Normalized-header substrings used for the temporary "check the real
+# column values" logging below - any recognized OR unrecognized column
+# whose normalized name contains one of these is worth inspecting when a
+# field is unexpectedly coming back null.
+_DEBUG_KEYWORD_SUBSTRINGS = (
+    "company", "employer", "location", "city", "state", "school", "university",
+    "college", "degree", "major", "graduation", "grad", "year",
+)
 
 FSU_CCI_SLUG = "fsu-cci"
 FSU_CCI_DEFAULT_UNIVERSITY = "Florida State University"
@@ -76,17 +85,18 @@ def normalize_header(header: str) -> str:
 # found in this priority order wins.
 FIELD_ALIASES: dict[str, list[str]] = {
     "graduation_year": [
-        "graduation_year", "grad_year", "graduation_date", "graduation", "class_year", "year_graduated",
+        "graduation_year", "grad_year", "year_graduated", "class_year", "graduation_date", "graduation",
     ],
     "major": [
-        "major", "major_name", "program", "program_of_study", "field_of_study", "area_of_study",
+        "major", "major_name", "program", "program_name", "program_of_study", "field_of_study",
+        "area_of_study",
     ],
     "degree": [
-        "degree", "degree_name", "degree_type", "education", "credential",
+        "degree", "degree_name", "degree_type", "credential", "education_degree", "education",
     ],
     "university": [
-        "university", "school", "school_name", "college", "institution", "institution_name",
-        "education_school",
+        "university", "school_name", "school", "college", "institution", "institution_name",
+        "education_institution", "education_school",
     ],
     # Explicit priority per spec: LinkedIn-sourced value first, then
     # "current", then the plain/generic column, then "existing" last.
@@ -94,9 +104,13 @@ FIELD_ALIASES: dict[str, list[str]] = {
         "linkedin_job_title", "current_job_title", "job_title", "title", "current_title",
         "position", "current_position", "existing_job_title",
     ],
+    # NOTE: the generic "organization" column is intentionally excluded -
+    # on multi-org deployments that column identifies the *portal*
+    # organization (e.g. "fsu-cci"), not the alumni's employer. Only the
+    # more specific "organization_name" alias is treated as an employer.
     "company": [
         "linkedin_company", "current_employer", "current_company", "company", "company_name",
-        "employer", "organization", "existing_company",
+        "employer", "existing_company", "organization_name", "workplace",
     ],
     "industry": [
         "industry", "current_industry", "career_industry",
@@ -108,8 +122,8 @@ FIELD_ALIASES: dict[str, list[str]] = {
         "seniority", "seniority_level", "career_level", "job_level", "level",
     ],
     "location_original": [
-        "linkedin_location", "current_location", "job_location", "location", "raw_location",
-        "address", "city_state", "existing_location",
+        "linkedin_location", "current_location", "job_location", "current_job_location", "location",
+        "existing_location", "city_state", "work_location", "geographic_location", "raw_location", "address",
     ],
     "city": ["city", "current_city", "job_city"],
     "state": ["state", "current_state", "job_state"],
@@ -156,12 +170,17 @@ def _clean_value(value: str | None) -> str | None:
     return stripped
 
 
-def _first_nonblank(row_by_alias: dict[str, str | None], aliases: list[str]) -> str | None:
+def _first_nonblank_with_source(
+    row_by_alias: dict[str, str | None], aliases: list[str]
+) -> tuple[str | None, str | None]:
+    """Returns (value, normalized_alias_that_provided_it). Both None if no
+    alias in the priority list had a nonblank value in this row.
+    """
     for alias in aliases:
         value = row_by_alias.get(alias)
         if value is not None:
-            return value
-    return None
+            return value, alias
+    return None, None
 
 
 def _normalize_linkedin_url(value: str | None) -> str | None:
@@ -220,6 +239,15 @@ class ImportSummary:
     rows_with_location: int = 0
     rows_with_city: int = 0
     rows_with_state: int = 0
+    # --- Additional temporary debugging fields (first data row only) ---
+    first_row_original: dict = field(default_factory=dict)
+    first_row_normalized: dict = field(default_factory=dict)
+    selected_company_column: str | None = None
+    selected_location_column: str | None = None
+    selected_university_column: str | None = None
+    selected_degree_column: str | None = None
+    selected_major_column: str | None = None
+    selected_graduation_year_column: str | None = None
 
 
 def _find_existing_alumni(
@@ -333,15 +361,56 @@ def import_alumni_csv(
                 if alias not in row_by_alias or row_by_alias[alias] is None:
                     row_by_alias[alias] = cleaned
 
-            resolved: dict[str, str | None] = {
-                field_name: _first_nonblank(row_by_alias, aliases) for field_name, aliases in FIELD_ALIASES.items()
-            }
+            resolved: dict[str, str | None] = {}
+            resolved_source: dict[str, str | None] = {}
+            for field_name, aliases in FIELD_ALIASES.items():
+                value, source = _first_nonblank_with_source(row_by_alias, aliases)
+                resolved[field_name] = value
+                resolved_source[field_name] = source
+
+            if row_index <= 6:  # first 5 data rows (header is row 1)
+                debug_columns = {
+                    alias: value
+                    for alias, value in row_by_alias.items()
+                    if value is not None and any(kw in alias for kw in _DEBUG_KEYWORD_SUBSTRINGS)
+                }
+                logger.info("CSV import row %s nonblank company/location/education/grad columns: %s",
+                            row_index, debug_columns)
 
             if row_index == 2:
                 logger.info(
-                    "CSV import first-row inspection: raw_row=%s resolved_fields=%s",
+                    "CSV import first-row inspection: raw_row=%s normalized_row=%s resolved_fields=%s "
+                    "resolved_sources=%s",
                     {k: v for k, v in raw_row.items() if k is not None},
+                    row_by_alias,
                     resolved,
+                    resolved_source,
+                )
+                logger.info(
+                    "CSV import first-row resolved values: company=%r location=%r university=%r "
+                    "degree=%r major=%r graduation_year=%r (sources: company=%r location=%r "
+                    "university=%r degree=%r major=%r graduation_year=%r)",
+                    resolved.get("company"), resolved.get("location_original"), resolved.get("university"),
+                    resolved.get("degree"), resolved.get("major"), resolved.get("graduation_year"),
+                    resolved_source.get("company"), resolved_source.get("location_original"),
+                    resolved_source.get("university"), resolved_source.get("degree"),
+                    resolved_source.get("major"), resolved_source.get("graduation_year"),
+                )
+                summary.first_row_original = {k: v for k, v in raw_row.items() if k is not None}
+                summary.first_row_normalized = row_by_alias
+                # Report the ORIGINAL header text (not the normalized alias)
+                # that fed each of these fields, since that's what's
+                # actually useful when comparing against the source file.
+                normalized_to_original = {norm: orig for orig, norm in header_to_normalized.items()}
+                summary.selected_company_column = normalized_to_original.get(resolved_source.get("company"))
+                summary.selected_location_column = normalized_to_original.get(
+                    resolved_source.get("location_original")
+                )
+                summary.selected_university_column = normalized_to_original.get(resolved_source.get("university"))
+                summary.selected_degree_column = normalized_to_original.get(resolved_source.get("degree"))
+                summary.selected_major_column = normalized_to_original.get(resolved_source.get("major"))
+                summary.selected_graduation_year_column = normalized_to_original.get(
+                    resolved_source.get("graduation_year")
                 )
 
             first_name = resolved.get("first_name")

@@ -1,6 +1,6 @@
 import io
 
-from app.models.alumni import Alumni
+from app.models.alumni import Alumni, AlumniOrganization
 
 
 def _login(client, username, password):
@@ -280,3 +280,87 @@ def test_reimporting_same_file_fills_previously_null_fields_without_duplicating(
     db_session.expire_all()
     records = db_session.query(Alumni).filter(Alumni.first_name == "Casey").all()
     assert len(records) == 1
+
+
+def test_reimport_fills_null_company_and_location_via_linkedin_columns(
+    client, organization, admin_user, db_session
+):
+    """Starts from an existing alumni record with null company/location
+    (as if it were imported before header mapping was fixed), then
+    reimports a row carrying LinkedIn Company/LinkedIn Location values and
+    verifies both fields get populated - proving update logic actually
+    writes nonblank resolved values, not just row creation."""
+    token = _login(client, "admin", "AdminPass123!")
+
+    existing = Alumni(
+        first_name="Riley", last_name="Chen", full_name="Riley Chen", graduation_year=2019,
+        company=None, location_original=None,
+    )
+    db_session.add(existing)
+    db_session.flush()
+    db_session.add(AlumniOrganization(alumni_id=existing.id, organization_id=organization.id))
+    db_session.commit()
+    assert existing.company is None
+    assert existing.location_original is None
+
+    csv_text = (
+        "First Name,Last Name,Graduation Year,LinkedIn Company,LinkedIn Location\n"
+        'Riley,Chen,2019,Delta Analytics,"Denver, CO"\n'
+    )
+    response = _upload(client, token, "fsu-cci", csv_text)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["created"] == 0
+    assert body["updated"] == 1
+    assert body["selected_company_column"] == "LinkedIn Company"
+    assert body["selected_location_column"] == "LinkedIn Location"
+
+    db_session.expire_all()
+    record = db_session.query(Alumni).filter(Alumni.first_name == "Riley").one()
+    assert record.company == "Delta Analytics"
+    assert record.location_original == "Denver, CO"
+    assert record.city == "Denver"
+    assert record.state == "Colorado"
+
+
+CSV_STUDENT_HEADERS = (
+    "Student Firstname,Student Lastname,School Name,Degree,Major,Graduation Year,"
+    "Existing Job Title,Existing Company,Existing Location,"
+    "LinkedIn Job Title,LinkedIn Company,LinkedIn Location,Industry,LinkedIn URL\n"
+    'Jamie,Ortiz,,M.S.,Data Science,2022,'
+    "Analyst I,OldCo,\"Old City, NV\","
+    "Senior Data Scientist,Insight Labs,\"Denver, CO\",Technology,"
+    "linkedin.com/in/jamieortiz\n"
+)
+
+
+def test_csv_import_maps_student_prefixed_and_existing_linkedin_headers(
+    client, organization, admin_user, db_session
+):
+    """Real dataset variant using 'Student Firstname/Lastname' plus the
+    Existing/LinkedIn compound columns."""
+    token = _login(client, "admin", "AdminPass123!")
+    response = _upload(client, token, "fsu-cci", CSV_STUDENT_HEADERS)
+    assert response.status_code == 200, response.text
+
+    body = response.json()
+    assert body["created"] == 1
+    assert body["failed"] == 0
+    assert body["unrecognized_headers"] == []
+    assert body["selected_company_column"] == "LinkedIn Company"
+    assert body["selected_location_column"] == "LinkedIn Location"
+    assert body["selected_university_column"] is None  # School Name was blank -> fsu-cci default applied
+    assert body["selected_degree_column"] == "Degree"
+    assert body["selected_major_column"] == "Major"
+    assert body["selected_graduation_year_column"] == "Graduation Year"
+
+    record = db_session.query(Alumni).filter(Alumni.first_name == "Jamie").one()
+    assert record.last_name == "Ortiz"
+    assert record.university == "Florida State University"
+    assert record.degree == "M.S."
+    assert record.major == "Data Science"
+    assert record.graduation_year == 2022
+    assert record.job_title == "Senior Data Scientist"
+    assert record.company == "Insight Labs"
+    assert record.location_original == "Denver, CO"
+    assert record.city == "Denver"

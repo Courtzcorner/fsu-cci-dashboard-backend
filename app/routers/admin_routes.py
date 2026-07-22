@@ -81,6 +81,14 @@ async def import_alumni(
         rows_with_location=summary.rows_with_location,
         rows_with_city=summary.rows_with_city,
         rows_with_state=summary.rows_with_state,
+        first_row_original=summary.first_row_original,
+        first_row_normalized=summary.first_row_normalized,
+        selected_company_column=summary.selected_company_column,
+        selected_location_column=summary.selected_location_column,
+        selected_university_column=summary.selected_university_column,
+        selected_degree_column=summary.selected_degree_column,
+        selected_major_column=summary.selected_major_column,
+        selected_graduation_year_column=summary.selected_graduation_year_column,
     )
 
 

@@ -34,12 +34,17 @@ class ImportResult(BaseModel):
     rows_with_location: int = 0
     rows_with_city: int = 0
     rows_with_state: int = 0
+    rows_with_raw_city: int = 0
+    rows_with_raw_state: int = 0
+    rows_with_constructed_location: int = 0
 
     # --- Additional temporary debugging fields (first data row only) ---
     first_row_original: dict = {}
     first_row_normalized: dict = {}
     selected_company_column: str | None = None
     selected_location_column: str | None = None
+    selected_city_column: str | None = None
+    selected_state_column: str | None = None
     selected_university_column: str | None = None
     selected_degree_column: str | None = None
     selected_major_column: str | None = None

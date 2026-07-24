@@ -364,3 +364,103 @@ def test_csv_import_maps_student_prefixed_and_existing_linkedin_headers(
     assert record.company == "Insight Labs"
     assert record.location_original == "Denver, CO"
     assert record.city == "Denver"
+
+
+# --- Separate City/State columns + ambiguous "Education" column ---
+
+CSV_CITY_STATE_AND_EDUCATION = (
+    "Last Name,First Name,Email,Linkedin URL,Company Name,Job Title,City,State,"
+    "Verification Status,Education\n"
+    "Bonney,Emma,emmabonney8@gmail.com,linkedin.com/in/emmabonney,"
+    "Blue Cross and Blue Shield of Alabama,Strategy Consultant II,Indianapolis,IN,"
+    "Updated,Florida State University\n"
+)
+
+
+def test_csv_import_uses_separate_city_state_columns_and_classifies_education_as_university(
+    client, organization, admin_user, db_session
+):
+    """Regression for the exact reported header set: no combined "Location"
+    column exists (only separate City/State), and "Education" holds an
+    institution name (not a degree) - both must be handled correctly."""
+    token = _login(client, "admin", "AdminPass123!")
+    response = _upload(client, token, "fsu-cci", CSV_CITY_STATE_AND_EDUCATION)
+    assert response.status_code == 200, response.text
+
+    body = response.json()
+    assert body["created"] == 1
+    assert body["failed"] == 0
+    assert body["unrecognized_headers"] == []
+    # No combined "location" column exists in this CSV.
+    assert body["selected_location_column"] is None
+    assert body["selected_city_column"] == "City"
+    assert body["selected_state_column"] == "State"
+    assert body["rows_with_city"] > 0
+    assert body["rows_with_state"] > 0
+    assert body["rows_with_location"] > 0
+    assert body["rows_with_raw_city"] > 0
+    assert body["rows_with_raw_state"] > 0
+    assert body["rows_with_constructed_location"] > 0
+    # "Education" was dynamically classified as a university value here.
+    assert body["selected_university_column"] == "Education"
+    assert body["selected_degree_column"] is None
+
+    record = db_session.query(Alumni).filter(Alumni.first_name == "Emma").one()
+    assert record.company == "Blue Cross and Blue Shield of Alabama"
+    assert record.job_title == "Strategy Consultant II"
+    assert record.university == "Florida State University"
+    assert record.degree is None
+    assert record.city == "Indianapolis"
+    assert record.state == "Indiana"
+    assert record.state_code == "IN"
+    assert record.location_original == "Indianapolis, IN"
+    assert record.display_location == "Indianapolis, IN"
+    assert record.location_normalization_status != "missing"
+
+
+def test_reimport_fills_previously_null_city_state_and_location(client, organization, admin_user, db_session):
+    """An existing record imported before city/state support existed (so
+    city/state/location_original are null) must get backfilled by a
+    reimport of the same row using the City/State columns - without
+    creating a duplicate."""
+    token = _login(client, "admin", "AdminPass123!")
+
+    existing = Alumni(
+        first_name="Devon", last_name="Park", full_name="Devon Park", graduation_year=2021,
+        city=None, state=None, state_code=None, location_original=None,
+    )
+    db_session.add(existing)
+    db_session.flush()
+    db_session.add(AlumniOrganization(alumni_id=existing.id, organization_id=organization.id))
+    db_session.commit()
+
+    csv_text = (
+        "First Name,Last Name,Graduation Year,City,State\n"
+        "Devon,Park,2021,Austin,TX\n"
+    )
+    response = _upload(client, token, "fsu-cci", csv_text)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["created"] == 0
+    assert body["updated"] == 1
+
+    db_session.expire_all()
+    record = db_session.query(Alumni).filter(Alumni.first_name == "Devon").one()
+    assert record.city == "Austin"
+    assert record.state == "Texas"
+    assert record.state_code == "TX"
+    assert record.location_original == "Austin, TX"
+
+    # A follow-up import with blank city/state must not erase these values.
+    blank_csv = "First Name,Last Name,Graduation Year,City,State\nDevon,Park,2021,,\n"
+    response = _upload(client, token, "fsu-cci", blank_csv)
+    assert response.json()["updated"] == 1
+
+    db_session.expire_all()
+    records = db_session.query(Alumni).filter(Alumni.first_name == "Devon").all()
+    assert len(records) == 1
+    record = records[0]
+    assert record.city == "Austin"
+    assert record.state == "Texas"
+    assert record.state_code == "TX"
+    assert record.location_original == "Austin, TX"

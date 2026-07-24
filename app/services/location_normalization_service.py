@@ -265,6 +265,70 @@ def _maybe_geocode(result: LocationNormalizationResult) -> LocationNormalization
     return result
 
 
+def normalize_city_state(
+    city: Optional[str], state: Optional[str], state_code_hint: Optional[str] = None
+) -> LocationNormalizationResult:
+    """Build a location result directly from separate, already-structured
+    city/state (or state_code) spreadsheet columns.
+
+    Unlike `normalize_location`, this never has to guess how to split a
+    free-text string apart - the columns are already structured - so a CSV
+    import should always prefer this over parsing a combined "location"
+    column when both are present (reliable structured data beats weaker
+    parsed data). Never invents a value: an unresolved state is preserved
+    verbatim rather than dropped, and country/state_code are only set when
+    genuinely resolved.
+    """
+    city_clean = city.strip() if city and city.strip() else None
+    state_clean = state.strip() if state and state.strip() else None
+    state_code_hint_clean = state_code_hint.strip() if state_code_hint and state_code_hint.strip() else None
+
+    if not city_clean and not state_clean:
+        return LocationNormalizationResult(
+            location_original=None, location_normalization_status=LocationNormalizationStatus.MISSING.value
+        )
+
+    display_city = _title_case_place(city_clean) if city_clean else None
+
+    state_name, state_code = (None, None)
+    if state_clean:
+        state_name, state_code = _resolve_state(state_clean)
+    if not state_code and state_code_hint_clean:
+        _, hinted_code = _resolve_state(state_code_hint_clean)
+        state_code = state_code or hinted_code
+
+    # Preserve the raw imported state text even when it doesn't resolve to
+    # a recognized US state - never silently drop a real value.
+    final_state = state_name or state_clean
+
+    # location_original/display_location are built from the RAW imported
+    # text (e.g. "Indianapolis, IN"), not the normalized full state name,
+    # since that's exactly what was in the source spreadsheet.
+    parts = [part for part in (display_city, state_clean) if part]
+    location_original = ", ".join(parts) if parts else None
+
+    metro_area = CITY_METRO_AREA.get(display_city.lower()) if display_city else None
+
+    if display_city and state_name:
+        status = LocationNormalizationStatus.NORMALIZED.value
+    elif display_city or final_state:
+        status = LocationNormalizationStatus.PARTIALLY_NORMALIZED.value
+    else:
+        status = LocationNormalizationStatus.AMBIGUOUS.value
+
+    result = LocationNormalizationResult(
+        location_original=location_original,
+        city=display_city,
+        state=final_state,
+        state_code=state_code,
+        country="United States" if state_name else None,
+        metro_area=metro_area,
+        display_location=location_original,
+        location_normalization_status=status,
+    )
+    return _maybe_geocode(result)
+
+
 def normalize_location(raw_value: Optional[str], db: Optional[Session] = None) -> LocationNormalizationResult:
     """Normalize a single raw location string into structured fields.
 

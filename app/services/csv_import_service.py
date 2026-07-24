@@ -34,7 +34,7 @@ from app.models.organization import Organization
 from app.models.reference import Company, Industry, University
 from app.services.audit_service import record_audit_log
 from app.services.classification_service import classify_alumni_fields
-from app.services.location_normalization_service import normalize_location
+from app.services.location_normalization_service import normalize_city_state, normalize_location
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +91,11 @@ FIELD_ALIASES: dict[str, list[str]] = {
         "major", "major_name", "program", "program_name", "program_of_study", "field_of_study",
         "area_of_study",
     ],
+    # NOTE: a generic "Education" column is intentionally NOT aliased here -
+    # its value is ambiguous (it might be an institution name OR a degree)
+    # and is resolved dynamically by `_classify_education_value` below.
     "degree": [
-        "degree", "degree_name", "degree_type", "credential", "education_degree", "education",
+        "degree", "degree_name", "degree_type", "credential", "education_degree",
     ],
     "university": [
         "university", "school_name", "school", "college", "institution", "institution_name",
@@ -125,8 +128,11 @@ FIELD_ALIASES: dict[str, list[str]] = {
         "linkedin_location", "current_location", "job_location", "current_job_location", "location",
         "existing_location", "city_state", "work_location", "geographic_location", "raw_location", "address",
     ],
-    "city": ["city", "current_city", "job_city"],
-    "state": ["state", "current_state", "job_state"],
+    "city": ["city", "current_city", "job_city", "location_city", "linkedin_city"],
+    "state": [
+        "state", "current_state", "job_state", "location_state", "linkedin_state",
+        "state_code", "state_abbreviation",
+    ],
     "state_code": ["state_code", "state_abbreviation", "state_abbrev"],
     "country": ["country", "current_country", "job_country"],
     "metro_area": ["metro_area", "metropolitan_area", "metro", "region"],
@@ -150,12 +156,47 @@ FIELD_ALIASES: dict[str, list[str]] = {
 # no backing Alumni column yet, so they are intentionally never added to
 # field_values below.
 
+# Headers that are recognized (so they never show up in
+# unrecognized_headers) but whose target field can't be decided purely
+# from the header name - the row's actual value decides it. See
+# `_classify_education_value`.
+EXTRA_RECOGNIZED_ALIASES: dict[str, str] = {
+    "education": "education_ambiguous",
+}
+
 # Reverse lookup: normalized header alias -> canonical field name. Used to
 # classify each incoming CSV header as recognized/unrecognized.
 ALIAS_TO_FIELD: dict[str, str] = {}
 for _field_name, _aliases in FIELD_ALIASES.items():
     for _alias in _aliases:
         ALIAS_TO_FIELD.setdefault(_alias, _field_name)
+for _alias, _field_name in EXTRA_RECOGNIZED_ALIASES.items():
+    ALIAS_TO_FIELD.setdefault(_alias, _field_name)
+
+_EDUCATION_UNIVERSITY_KEYWORDS = ("university", "college", "institute", "school", "academy", "fsu")
+_EDUCATION_DEGREE_PATTERN = re.compile(
+    r"\b(bachelor'?s?|master'?s?|mba|ph\.?d\.?|doctorate|associate'?s?|certificate|"
+    r"b\.?a\.?|b\.?s\.?|m\.?a\.?|m\.?s\.?)\b",
+    re.IGNORECASE,
+)
+
+
+def _classify_education_value(value: str) -> str:
+    """Classifies an ambiguous "Education" column value as either an
+    institution name ("university") or a credential ("degree").
+
+    Institution-style content always wins (e.g. "Bachelor of Science,
+    Florida State University" is a university value, not a degree one),
+    since the whole point of this field is to identify the alumni's
+    school. An unrecognized free-text value defaults to "degree" to match
+    this column's traditional meaning.
+    """
+    lowered = value.lower()
+    if any(keyword in lowered for keyword in _EDUCATION_UNIVERSITY_KEYWORDS):
+        return "university"
+    if _EDUCATION_DEGREE_PATTERN.search(value):
+        return "degree"
+    return "degree"
 
 
 def _clean_value(value: str | None) -> str | None:
@@ -239,11 +280,16 @@ class ImportSummary:
     rows_with_location: int = 0
     rows_with_city: int = 0
     rows_with_state: int = 0
+    rows_with_raw_city: int = 0
+    rows_with_raw_state: int = 0
+    rows_with_constructed_location: int = 0
     # --- Additional temporary debugging fields (first data row only) ---
     first_row_original: dict = field(default_factory=dict)
     first_row_normalized: dict = field(default_factory=dict)
     selected_company_column: str | None = None
     selected_location_column: str | None = None
+    selected_city_column: str | None = None
+    selected_state_column: str | None = None
     selected_university_column: str | None = None
     selected_degree_column: str | None = None
     selected_major_column: str | None = None
@@ -377,6 +423,44 @@ def import_alumni_csv(
                 logger.info("CSV import row %s nonblank company/location/education/grad columns: %s",
                             row_index, debug_columns)
 
+            # --- Education column disambiguation ---
+            # A generic "Education" column is ambiguous (it could hold an
+            # institution name or a degree/credential), so it's resolved by
+            # value, not by header name, and only used as a fallback when a
+            # more specific university/degree column didn't already supply
+            # a value.
+            university_raw = resolved.get("university")
+            degree_raw = resolved.get("degree")
+            university_source = resolved_source.get("university")
+            degree_source = resolved_source.get("degree")
+            education_raw = row_by_alias.get("education")
+            if education_raw:
+                education_target = _classify_education_value(education_raw)
+                if education_target == "university" and not university_raw:
+                    university_raw = education_raw
+                    university_source = "education"
+                elif education_target == "degree" and not degree_raw:
+                    degree_raw = education_raw
+                    degree_source = "education"
+
+            # --- Location: separate city/state columns take priority ---
+            # Reliable structured columns (City / State) always win over
+            # parsing a combined "location" column - never overwrite them
+            # with weaker parsed data. The combined column is only used as
+            # a fallback when no separate city/state values exist.
+            city_raw = resolved.get("city")
+            state_raw = resolved.get("state")
+            combined_location_raw = resolved.get("location_original")
+            constructed_from_city_state = bool(city_raw or state_raw)
+
+            location_fields: dict = {}
+            if constructed_from_city_state:
+                location_result = normalize_city_state(city_raw, state_raw, state_code_hint=resolved.get("state_code"))
+                location_fields = location_result.as_dict()
+            elif combined_location_raw:
+                location_result = normalize_location(combined_location_raw, db=db)
+                location_fields = location_result.as_dict()
+
             if row_index == 2:
                 logger.info(
                     "CSV import first-row inspection: raw_row=%s normalized_row=%s resolved_fields=%s "
@@ -387,13 +471,15 @@ def import_alumni_csv(
                     resolved_source,
                 )
                 logger.info(
-                    "CSV import first-row resolved values: company=%r location=%r university=%r "
-                    "degree=%r major=%r graduation_year=%r (sources: company=%r location=%r "
-                    "university=%r degree=%r major=%r graduation_year=%r)",
-                    resolved.get("company"), resolved.get("location_original"), resolved.get("university"),
-                    resolved.get("degree"), resolved.get("major"), resolved.get("graduation_year"),
+                    "CSV import first-row resolved values: company=%r location=%r (constructed_from_city_state=%s) "
+                    "city=%r state=%r university=%r degree=%r major=%r graduation_year=%r "
+                    "(sources: company=%r location=%r city=%r state=%r university=%r degree=%r "
+                    "major=%r graduation_year=%r)",
+                    resolved.get("company"), location_fields.get("location_original"), constructed_from_city_state,
+                    city_raw, state_raw, university_raw, degree_raw, resolved.get("major"),
+                    resolved.get("graduation_year"),
                     resolved_source.get("company"), resolved_source.get("location_original"),
-                    resolved_source.get("university"), resolved_source.get("degree"),
+                    resolved_source.get("city"), resolved_source.get("state"), university_source, degree_source,
                     resolved_source.get("major"), resolved_source.get("graduation_year"),
                 )
                 summary.first_row_original = {k: v for k, v in raw_row.items() if k is not None}
@@ -403,11 +489,16 @@ def import_alumni_csv(
                 # actually useful when comparing against the source file.
                 normalized_to_original = {norm: orig for orig, norm in header_to_normalized.items()}
                 summary.selected_company_column = normalized_to_original.get(resolved_source.get("company"))
-                summary.selected_location_column = normalized_to_original.get(
-                    resolved_source.get("location_original")
+                # A combined location column is only "selected" if it was
+                # actually used - i.e. no separate city/state took priority.
+                summary.selected_location_column = (
+                    None if constructed_from_city_state
+                    else normalized_to_original.get(resolved_source.get("location_original"))
                 )
-                summary.selected_university_column = normalized_to_original.get(resolved_source.get("university"))
-                summary.selected_degree_column = normalized_to_original.get(resolved_source.get("degree"))
+                summary.selected_city_column = normalized_to_original.get(resolved_source.get("city"))
+                summary.selected_state_column = normalized_to_original.get(resolved_source.get("state"))
+                summary.selected_university_column = normalized_to_original.get(university_source)
+                summary.selected_degree_column = normalized_to_original.get(degree_source)
                 summary.selected_major_column = normalized_to_original.get(resolved_source.get("major"))
                 summary.selected_graduation_year_column = normalized_to_original.get(
                     resolved_source.get("graduation_year")
@@ -437,14 +528,6 @@ def import_alumni_csv(
 
             linkedin_url = _normalize_linkedin_url(resolved.get("linkedin_url"))
 
-            # Location normalization only ever runs once location_original
-            # is actually populated - never on a blank value.
-            location_original = resolved.get("location_original")
-            location_fields: dict = {}
-            if location_original:
-                location_result = normalize_location(location_original, db=db)
-                location_fields = location_result.as_dict()
-
             job_title = resolved.get("job_title")
             company = resolved.get("company")
 
@@ -459,8 +542,6 @@ def import_alumni_csv(
             # nonblank value - a miss (None) must never overwrite an
             # existing DB value on update.
             classification = {k: v for k, v in classification.items() if v is not None}
-
-            university_raw = resolved.get("university")
 
             raw_verified = resolved.get("verified")
             raw_verification_status = resolved.get("verification_status")
@@ -490,8 +571,8 @@ def import_alumni_csv(
                 field_values["graduation_year"] = graduation_year
             if resolved.get("major"):
                 field_values["major"] = resolved["major"]
-            if resolved.get("degree"):
-                field_values["degree"] = resolved["degree"]
+            if degree_raw:
+                field_values["degree"] = degree_raw
             if job_title:
                 field_values["job_title"] = job_title
             if company:
@@ -555,12 +636,18 @@ def import_alumni_csv(
                 summary.rows_with_job_title += 1
             if company:
                 summary.rows_with_company += 1
-            if location_original:
+            if location_fields.get("location_original"):
                 summary.rows_with_location += 1
             if location_fields.get("city"):
                 summary.rows_with_city += 1
             if location_fields.get("state"):
                 summary.rows_with_state += 1
+            if city_raw:
+                summary.rows_with_raw_city += 1
+            if state_raw:
+                summary.rows_with_raw_state += 1
+            if constructed_from_city_state and location_fields.get("location_original"):
+                summary.rows_with_constructed_location += 1
 
             _get_or_create_reference(db, Company, organization.id, company, reference_cache)
             _get_or_create_reference(db, Industry, organization.id, field_values.get("industry"), reference_cache)

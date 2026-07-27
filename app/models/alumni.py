@@ -45,6 +45,28 @@ class Alumni(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     verification_status: Mapped[str] = mapped_column(String(32), default="unverified", nullable=False)
     verification_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
+    # Used (in priority order, after normalized LinkedIn URL) to match a CSV
+    # row to an existing alumni record during import, so reimporting the
+    # same file never creates duplicates.
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+
+    # --- Single active dataset (replace-mode CSV import) ---
+    # Only alumni from the most recently uploaded ("current") CSV import are
+    # active. A new successful import activates its own rows and deactivates
+    # every alumni row not represented in that import; nothing is ever
+    # physically deleted. All read endpoints (GET /alumni-data, GET
+    # /analytics/summary) filter on is_active == True.
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    # id of the CSVImport that most recently created/confirmed this alumni
+    # row as part of the active dataset. Nullable for rows that predate this
+    # feature or were never re-touched by a replace-mode import.
+    source_import_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("csv_imports.id", ondelete="SET NULL", use_alter=True, name="fk_alumni_source_import_id"),
+        nullable=True,
+        index=True,
+    )
+
     profile_image_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     bio: Mapped[str | None] = mapped_column(String(4000), nullable=True)
     profile_visibility: Mapped[str] = mapped_column(String(32), default="organization", nullable=False)

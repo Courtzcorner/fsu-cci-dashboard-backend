@@ -65,9 +65,12 @@ def test_3_a_newly_authenticated_alumni_user_retrieves_the_records(client, admin
         headers={"Authorization": f"Bearer {alumni_token}"},
     )
     assert response.status_code == 200
-    # +1 for the alumni_user fixture's own linked alumni record, which
-    # also belongs to fsu-cci.
-    assert response.json()["meta"]["total"] == 250
+    # Single active dataset ("replace mode"): the alumni_user fixture's own
+    # linked alumni record is NOT part of this CSV upload, so it is
+    # archived (not deleted) along with every other alumni missing from
+    # the latest authoritative import - only the 249 imported rows remain
+    # active/visible.
+    assert response.json()["meta"]["total"] == 249
 
 
 def test_4_records_still_exist_in_a_brand_new_database_session(client, admin_user, organization):

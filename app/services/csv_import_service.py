@@ -24,7 +24,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -37,6 +37,13 @@ from app.services.classification_service import classify_alumni_fields
 from app.services.location_normalization_service import normalize_city_state, normalize_location
 
 logger = logging.getLogger(__name__)
+
+# Temporary deploy marker: the import response and startup log both emit
+# this value so we can confirm Render is running replace-mode code rather
+# than a stale merge/upsert build. Safe to remove once production has
+# been verified end-to-end.
+IMPORT_LOGIC_VERSION = "replace-v2"
+logger.info("CSV replacement import logic %s loaded", IMPORT_LOGIC_VERSION)
 
 REQUIRED_FIELDS = {"first_name", "last_name"}
 
@@ -142,6 +149,7 @@ FIELD_ALIASES: dict[str, list[str]] = {
     "last_name": ["last_name", "lastname", "last", "student_lastname", "student_last_name"],
     "full_name": ["full_name", "name", "student_name", "alumni_name"],
     "verification_status": ["verification_status", "verified_status", "education_match_status"],
+    "verification_date": ["verification_date", "verified_date", "verification_timestamp", "date_verified"],
     "verified": ["verified", "is_verified"],
     # Recognized (won't be flagged as "unrecognized") but not yet persisted
     # to an Alumni column - no schema field exists for these today.
@@ -225,6 +233,11 @@ def _first_nonblank_with_source(
 
 
 def _normalize_linkedin_url(value: str | None) -> str | None:
+    """Normalizes a LinkedIn URL into a stable, comparable form so the same
+    profile always dedupe-matches across uploads regardless of superficial
+    formatting differences (scheme, www., country subdomain, trailing slash,
+    query string, fragment, casing).
+    """
     if not value:
         return None
     url = value.strip()
@@ -232,11 +245,26 @@ def _normalize_linkedin_url(value: str | None) -> str | None:
         return None
     if not url.startswith("http://") and not url.startswith("https://"):
         url = f"https://{url}"
-    url = url.rstrip("/")
-    # Collapse http -> https and strip tracking query strings for stable dedup matching.
+    # Collapse http -> https, drop query strings and #fragments, drop a
+    # trailing slash, and lowercase. Prefer the stable /in/<slug> (or
+    # /pub/<slug>) identity when present so www vs non-www and
+    # uk.linkedin.com vs linkedin.com all collapse to the same key.
     url = url.replace("http://", "https://")
     url = url.split("?")[0]
-    return url
+    url = url.split("#")[0]
+    url = url.rstrip("/")
+    profile_match = re.search(
+        r"linkedin\.com/(in|pub)/([^/?#]+)", url, flags=re.IGNORECASE
+    )
+    if profile_match:
+        kind = profile_match.group(1).lower()
+        slug = profile_match.group(2).strip("/").lower()
+        if slug:
+            # Canonical stored + match key: always https, never www.
+            return f"https://linkedin.com/{kind}/{slug}"
+    url = re.sub(r"^https://([a-z0-9-]+\.)?www\.", "https://", url, flags=re.IGNORECASE)
+    url = re.sub(r"^https://www\.", "https://", url, flags=re.IGNORECASE)
+    return url.lower()
 
 
 def _parse_graduation_year(value: str | None) -> tuple[int | None, str | None]:
@@ -254,6 +282,108 @@ def _parse_bool(value: str | None) -> bool:
     return value.strip().lower() in {"true", "yes", "1", "y", "verified"}
 
 
+def _parse_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    # ISO first (e.g. "2026-06-15" or "2026-06-15T00:00:00Z").
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        pass
+    for fmt in ("%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _normalize_whitespace(value: str | None) -> str | None:
+    """Collapses internal whitespace runs to a single space (e.g. tabs,
+    double spaces from copy-pasted spreadsheet data). Leading/trailing
+    whitespace is already stripped by `_clean_value`.
+    """
+    if not value:
+        return value
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _normalize_email(value: str | None) -> str | None:
+    if not value:
+        return None
+    return value.strip().lower()
+
+
+def _normalize_name_part(value: str | None) -> str:
+    """Normalize a first/last name for matching: lowercase, strip
+    parenthetical nicknames (e.g. "John (Johnny)"), drop punctuation,
+    and collapse whitespace. "O'Neil" and "ONeil" intentionally remain
+    distinct after punctuation removal only if letters differ; both
+    "O'Neil" and "O’Neil" become "o neil".
+    """
+    if not value:
+        return ""
+    text = value.strip().lower()
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _compute_dedupe_key(
+    linkedin_url: str | None, email: str | None, first_name: str, last_name: str
+) -> str:
+    """Priority: normalized LinkedIn URL > normalized email > normalized
+    first+last name. Used to collapse duplicate rows WITHIN a single CSV
+    upload so the same person is never created/updated twice from one file.
+    """
+    if linkedin_url:
+        return f"linkedin:{linkedin_url}"
+    normalized_email = _normalize_email(email)
+    if normalized_email:
+        return f"email:{normalized_email}"
+    return f"name:{_normalize_name_part(first_name)}:{_normalize_name_part(last_name)}"
+
+
+def _describe_match_attempt(
+    linkedin_url: str | None,
+    email: str | None,
+    first_name: str,
+    last_name: str,
+) -> tuple[list[str], str]:
+    """Return (strategies_attempted, unmatched_reason) for create diagnostics."""
+    strategies: list[str] = []
+    if linkedin_url:
+        strategies.append("linkedin_url")
+    if email:
+        strategies.append("email")
+    strategies.append("first_name+last_name")
+
+    if linkedin_url and email:
+        reason = (
+            "no existing alumni matched normalized linkedin_url or email; "
+            "name fallback also found no match"
+        )
+    elif linkedin_url:
+        reason = (
+            "no existing alumni matched normalized linkedin_url; "
+            "no email provided; name fallback also found no match"
+        )
+    elif email:
+        reason = (
+            "no linkedin_url provided; normalized email did not match any "
+            "existing alumni; name fallback also found no match"
+        )
+    else:
+        reason = (
+            "no linkedin_url or email provided; normalized first+last name "
+            "found no existing alumni"
+        )
+    return strategies, reason
+
+
 @dataclass
 class RowOutcome:
     action: str  # "created" | "updated" | "skipped" | "failed"
@@ -264,11 +394,39 @@ class RowOutcome:
 class ImportSummary:
     created: int = 0
     updated: int = 0
+    unchanged: int = 0
+    archived: int = 0  # alias: "deactivated" in the API response
     skipped: int = 0
     failed: int = 0
     row_errors: list[dict] = field(default_factory=list)
     csv_import_id: str | None = None
-    database_total: int = 0
+    filename: str | None = None
+    database_total: int = 0  # legacy alias for active_database_total, kept for backward compatibility
+    active_database_total: int = 0
+    # Total alumni_organizations rows for this organization regardless of
+    # is_active - i.e. every row ever created, including everything this
+    # import just archived. NEVER use this as the dashboard total; it is
+    # provided purely for admin/debugging visibility into how much history
+    # exists versus how much is currently active.
+    historical_database_total: int = 0
+    # Temporary deploy marker confirming this response came from the
+    # replace-mode import path (not a stale merge/upsert build).
+    import_logic_version: str = IMPORT_LOGIC_VERSION
+    # --- Line/row accounting ---
+    # physical_lines counts every line in the raw uploaded file (including
+    # the header); header_rows is 0 or 1; data_rows = physical_lines minus
+    # header_rows, i.e. "how many alumni rows the file actually contains,
+    # independent of how many parsed cleanly."
+    csv_physical_lines: int = 0
+    csv_header_rows: int = 0
+    csv_data_rows: int = 0
+    csv_rows_received: int = 0  # legacy alias for csv_data_rows
+    csv_valid_rows: int = 0
+    csv_invalid_rows: int = 0
+    csv_rows_valid: int = 0  # legacy alias for csv_valid_rows
+    csv_rows_invalid: int = 0  # legacy alias for csv_invalid_rows
+    csv_duplicate_rows: int = 0
+    status: str = "complete"
     # --- Temporary diagnostics (see admin_routes/ImportResult) ---
     recognized_headers: list[str] = field(default_factory=list)
     unrecognized_headers: list[str] = field(default_factory=list)
@@ -294,44 +452,93 @@ class ImportSummary:
     selected_degree_column: str | None = None
     selected_major_column: str | None = None
     selected_graduation_year_column: str | None = None
+    # --- Duplicate-matching audit diagnostics (temporary) ---
+    # For each newly created alumni row: normalized identifiers + which
+    # matching strategies were attempted and why none matched. Used to
+    # audit the recurring "6 created on every upload" production bug.
+    newly_created_identifiers: list[dict] = field(default_factory=list)
+    # Count of newly-created rows whose normalized first+last name matches
+    # an alumni that is ALREADY active under a different identifier - a
+    # strong signal of an unnoticed duplicate person worth a manual look,
+    # even though the matching rules correctly did not auto-merge them.
+    duplicate_candidates_found: int = 0
 
 
-def _find_existing_alumni(
-    db: Session,
-    organization_id: str,
-    linkedin_url: str | None,
-    email: str | None,
-    first_name: str,
-    last_name: str,
-    graduation_year: int | None,
-) -> Alumni | None:
-    """Duplicate matching priority: LinkedIn URL > email > (first, last,
-    graduation_year, organization). Never match on name alone.
+@dataclass
+class _AlumniMatchIndex:
+    """In-memory lookup of every alumni already linked to an organization.
+
+    Matching must normalize BOTH the incoming CSV values and the values
+    already stored in the database. A plain case-insensitive SQL compare
+    fails for LinkedIn URLs that differ only by www., trailing slash,
+    query string, or fragment - which is exactly how six rows were being
+    recreated on every reimport of the same file.
     """
-    base_query = (
+
+    by_linkedin: dict[str, Alumni] = field(default_factory=dict)
+    by_email: dict[str, Alumni] = field(default_factory=dict)
+    by_name: dict[str, Alumni] = field(default_factory=dict)
+
+    def register(self, alumni: Alumni) -> None:
+        linkedin_key = _normalize_linkedin_url(alumni.linkedin_url)
+        if linkedin_key and linkedin_key not in self.by_linkedin:
+            self.by_linkedin[linkedin_key] = alumni
+
+        email_key = _normalize_email(alumni.email)
+        if email_key and email_key not in self.by_email:
+            self.by_email[email_key] = alumni
+
+        name_key = (
+            f"{_normalize_name_part(alumni.first_name)}:{_normalize_name_part(alumni.last_name)}"
+        )
+        if name_key != ":" and name_key not in self.by_name:
+            self.by_name[name_key] = alumni
+
+    def find(
+        self,
+        linkedin_url: str | None,
+        email: str | None,
+        first_name: str,
+        last_name: str,
+    ) -> Alumni | None:
+        """Priority: normalized LinkedIn URL > normalized email >
+        normalized first+last name.
+        """
+        if linkedin_url:
+            match = self.by_linkedin.get(linkedin_url)
+            if match is not None:
+                return match
+
+        normalized_email = _normalize_email(email)
+        if normalized_email:
+            match = self.by_email.get(normalized_email)
+            if match is not None:
+                return match
+
+        name_key = f"{_normalize_name_part(first_name)}:{_normalize_name_part(last_name)}"
+        if name_key != ":":
+            match = self.by_name.get(name_key)
+            if match is not None:
+                return match
+
+        return None
+
+
+def _build_alumni_match_index(db: Session, organization_id: str) -> _AlumniMatchIndex:
+    """Load every alumni linked to this organization (active OR archived)
+    into a normalized match index. Archived rows must still match so a
+    reimport updates the existing person instead of creating a duplicate.
+    """
+    index = _AlumniMatchIndex()
+    existing_rows = (
         db.query(Alumni)
         .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id)
         .filter(AlumniOrganization.organization_id == organization_id)
+        .all()
     )
-
-    if linkedin_url:
-        match = base_query.filter(Alumni.linkedin_url == linkedin_url).first()
-        if match:
-            return match
-
-    # `email` is not yet a persisted column (spec: "email if later
-    # available") - reserved for when that column is added to the schema.
-
-    if graduation_year is not None:
-        match = base_query.filter(
-            Alumni.first_name.ilike(first_name),
-            Alumni.last_name.ilike(last_name),
-            Alumni.graduation_year == graduation_year,
-        ).first()
-        if match:
-            return match
-
-    return None
+    for alumni in existing_rows:
+        index.register(alumni)
+    return index
 
 
 def _get_or_create_reference(db: Session, model, organization_id: str, name: str | None, cache: dict) -> None:
@@ -363,15 +570,35 @@ def import_alumni_csv(
     filename: str | None = None,
 ) -> ImportSummary:
     summary = ImportSummary()
+    summary.filename = filename
+    summary.import_logic_version = IMPORT_LOGIC_VERSION
     reference_cache: dict = {}
+    logger.info(
+        "CSV replacement import logic %s executing for organization_slug=%s filename=%s",
+        IMPORT_LOGIC_VERSION,
+        organization.slug,
+        filename,
+    )
 
     text = file_bytes.decode("utf-8-sig", errors="replace")
+
+    # --- Physical line accounting (independent of how csv.DictReader
+    # parses rows) ---
+    # A single trailing blank line (the file ending in a newline) is not
+    # counted as a physical data line - that's how every spreadsheet
+    # export works, and counting it would over-report by exactly 1.
+    physical_lines = text.splitlines()
+    if physical_lines and physical_lines[-1].strip() == "":
+        physical_lines = physical_lines[:-1]
+    summary.csv_physical_lines = len(physical_lines)
+
     reader = csv.DictReader(io.StringIO(text))
 
     if reader.fieldnames is None:
         summary.row_errors.append({"row": 0, "error": "CSV file has no header row"})
         return summary
 
+    summary.csv_header_rows = 1
     original_headers = list(reader.fieldnames)
     # original header -> normalized alias string (e.g. "Current Job Title" -> "current_job_title")
     header_to_normalized = {h: normalize_header(h) for h in original_headers}
@@ -388,6 +615,19 @@ def import_alumni_csv(
         "recognized=%s unrecognized=%s",
         original_headers, list(header_to_normalized.values()), recognized_headers, unrecognized_headers,
     )
+
+    # --- Replace-mode bookkeeping ---
+    # `touched_alumni_ids` collects every alumni created/updated/confirmed
+    # by THIS import; anything previously active but NOT in this set gets
+    # archived once the whole file has been processed (see below). This is
+    # what makes "the most recently uploaded CSV" the complete, exclusive,
+    # authoritative dataset.
+    touched_alumni_ids: set[str] = set()
+    seen_dedupe_keys: set[str] = set()
+    # Match against EVERY alumni ever linked to this organization (including
+    # archived ones), with LinkedIn/email/name normalized on BOTH sides so
+    # historical URL formatting differences cannot create duplicates.
+    match_index = _build_alumni_match_index(db, organization.id)
 
     rows_parsed = 0
     for row_index, raw_row in enumerate(reader, start=2):  # header is row 1
@@ -504,9 +744,9 @@ def import_alumni_csv(
                     resolved_source.get("graduation_year")
                 )
 
-            first_name = resolved.get("first_name")
-            last_name = resolved.get("last_name")
-            full_name_raw = resolved.get("full_name")
+            first_name = _normalize_whitespace(resolved.get("first_name"))
+            last_name = _normalize_whitespace(resolved.get("last_name"))
+            full_name_raw = _normalize_whitespace(resolved.get("full_name"))
 
             if (not first_name or not last_name) and full_name_raw:
                 parts = full_name_raw.split(" ", 1)
@@ -515,6 +755,7 @@ def import_alumni_csv(
 
             if not first_name or not last_name:
                 summary.failed += 1
+                summary.csv_rows_invalid += 1
                 summary.row_errors.append(
                     {"row": row_index, "error": "Missing required field(s): first_name/last_name"}
                 )
@@ -527,9 +768,18 @@ def import_alumni_csv(
                 summary.row_errors.append({"row": row_index, "error": grad_year_error})
 
             linkedin_url = _normalize_linkedin_url(resolved.get("linkedin_url"))
+            email = resolved.get("email")
 
-            job_title = resolved.get("job_title")
-            company = resolved.get("company")
+            # --- In-file dedupe: never create/update the same person twice
+            # from a single upload (e.g. two rows sharing a LinkedIn URL). ---
+            dedupe_key = _compute_dedupe_key(linkedin_url, email, first_name, last_name)
+            if dedupe_key in seen_dedupe_keys:
+                summary.csv_duplicate_rows += 1
+                continue
+            seen_dedupe_keys.add(dedupe_key)
+
+            job_title = _normalize_whitespace(resolved.get("job_title"))
+            company = _normalize_whitespace(resolved.get("company"))
 
             classification = classify_alumni_fields(
                 job_title=job_title,
@@ -540,20 +790,28 @@ def import_alumni_csv(
             )
             # Only keep classification keys that actually resolved to a
             # nonblank value - a miss (None) must never overwrite an
-            # existing DB value on update.
-            classification = {k: v for k, v in classification.items() if v is not None}
+            # existing DB value on update. A "*_source" key is only kept
+            # alongside its corresponding value key: classify_alumni_fields
+            # always returns a source (even "unknown"), so on a row with no
+            # job_title/company at all, dropping the orphaned *_source
+            # prevents a row that changed NOTHING visible from spuriously
+            # registering as "updated" instead of "unchanged".
+            classification = {
+                k: v
+                for k, v in classification.items()
+                if v is not None and (not k.endswith("_source") or classification.get(k[: -len("_source")]) is not None)
+            }
 
             raw_verified = resolved.get("verified")
             raw_verification_status = resolved.get("verification_status")
+            raw_verification_date = resolved.get("verification_date")
+            parsed_verification_date = _parse_date(raw_verification_date)
 
-            existing = _find_existing_alumni(
-                db,
-                organization_id=organization.id,
+            existing = match_index.find(
                 linkedin_url=linkedin_url,
-                email=resolved.get("email"),
+                email=email,
                 first_name=first_name,
                 last_name=last_name,
-                graduation_year=graduation_year,
             )
 
             # field_values only ever contains keys we actually want to
@@ -579,6 +837,8 @@ def import_alumni_csv(
                 field_values["company"] = company
             if linkedin_url:
                 field_values["linkedin_url"] = linkedin_url
+            if email:
+                field_values["email"] = _normalize_email(email)
             field_values.update(location_fields)
             field_values.update(classification)
 
@@ -593,12 +853,21 @@ def import_alumni_csv(
             if raw_verified is not None:
                 verified_bool = _parse_bool(raw_verified)
                 field_values["verified"] = verified_bool
-                field_values["verification_date"] = datetime.now(timezone.utc).date() if verified_bool else None
+                # An explicit "Verification Date" column always wins; only
+                # fall back to today's date when the CSV didn't provide one.
+                field_values["verification_date"] = (
+                    parsed_verification_date
+                    if parsed_verification_date is not None
+                    else (datetime.now(timezone.utc).date() if verified_bool else None)
+                )
                 field_values["verification_status"] = raw_verification_status or (
                     "verified" if verified_bool else "unverified"
                 )
-            elif raw_verification_status is not None:
-                field_values["verification_status"] = raw_verification_status
+            else:
+                if raw_verification_status is not None:
+                    field_values["verification_status"] = raw_verification_status
+                if parsed_verification_date is not None:
+                    field_values["verification_date"] = parsed_verification_date
 
             tracked_fields = [
                 "job_title", "company", "industry", "major", "degree", "university",
@@ -611,17 +880,82 @@ def import_alumni_csv(
             field_values["profile_completion"] = _compute_profile_completion(effective)
 
             if existing:
+                changed = False
                 for key, value in field_values.items():
+                    if getattr(existing, key, None) != value:
+                        changed = True
                     setattr(existing, key, value)
-                summary.updated += 1
+                if changed:
+                    summary.updated += 1
+                else:
+                    summary.unchanged += 1
                 alumni_id = existing.id
+                # Re-register so any newly filled LinkedIn/email on this
+                # update is available to later rows in the same file.
+                match_index.register(existing)
             else:
                 alumni = Alumni(**field_values)
                 db.add(alumni)
                 db.flush()
-                db.add(AlumniOrganization(alumni_id=alumni.id, organization_id=organization.id))
+                db.add(
+                    AlumniOrganization(
+                        alumni_id=alumni.id,
+                        organization_id=organization.id,
+                    )
+                )
                 summary.created += 1
                 alumni_id = alumni.id
+                match_index.register(alumni)
+
+                # --- Duplicate-matching audit for this newly created row ---
+                strategies_attempted, unmatched_reason = _describe_match_attempt(
+                    linkedin_url, email, first_name, last_name
+                )
+                created_diag = {
+                    "row": row_index,
+                    "normalized_linkedin_url": linkedin_url,
+                    "normalized_email": _normalize_email(email),
+                    "normalized_full_name": (
+                        f"{_normalize_name_part(first_name)} {_normalize_name_part(last_name)}".strip()
+                    ),
+                    "matching_strategies_attempted": strategies_attempted,
+                    "unmatched_reason": unmatched_reason,
+                }
+                summary.newly_created_identifiers.append(created_diag)
+                logger.info(
+                    "CSV import created unmatched row: row=%s normalized_full_name=%r "
+                    "normalized_linkedin_url=%r normalized_email=%r "
+                    "matching_strategies_attempted=%s unmatched_reason=%s "
+                    "import_logic_version=%s",
+                    row_index,
+                    created_diag["normalized_full_name"],
+                    linkedin_url,
+                    created_diag["normalized_email"],
+                    strategies_attempted,
+                    unmatched_reason,
+                    IMPORT_LOGIC_VERSION,
+                )
+                # A same-named ACTIVE alumni that still exists after this
+                # creation (i.e. wasn't touched/matched by this import) is a
+                # strong signal this "new" row might actually be a duplicate
+                # of an existing person under a different identifier.
+                name_collision = (
+                    db.query(Alumni)
+                    .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id)
+                    .filter(
+                        AlumniOrganization.organization_id == organization.id,
+                        Alumni.is_active.is_(True),
+                        Alumni.id != alumni_id,
+                        Alumni.first_name.ilike(first_name),
+                        Alumni.last_name.ilike(last_name),
+                    )
+                    .first()
+                )
+                if name_collision is not None:
+                    summary.duplicate_candidates_found += 1
+
+            touched_alumni_ids.add(alumni_id)
+            summary.csv_rows_valid += 1
 
             if row_index == 2:
                 logger.info("CSV import first-row mapped Alumni fields: %s", field_values)
@@ -665,7 +999,35 @@ def import_alumni_csv(
 
         except Exception as exc:  # noqa: BLE001 - row-level isolation is intentional
             summary.failed += 1
+            summary.csv_rows_invalid += 1
             summary.row_errors.append({"row": row_index, "error": str(exc)})
+
+    summary.csv_rows_received = rows_parsed
+    summary.csv_data_rows = max(summary.csv_physical_lines - summary.csv_header_rows, 0)
+    summary.csv_valid_rows = summary.csv_rows_valid
+    summary.csv_invalid_rows = summary.csv_rows_invalid
+
+    # Safety net: a genuinely successful "replace mode" import must produce
+    # at least one valid alumni row. Zero valid rows out of a nonempty file
+    # almost always means a bad/garbled upload, not an intentional "wipe
+    # the whole dashboard" action - so it is treated as a failed import and
+    # the previous active dataset is preserved untouched, per requirement
+    # #10 ("Preserve the previous dataset if the new import fails").
+    if rows_parsed > 0 and summary.csv_rows_valid == 0:
+        db.rollback()
+        summary.status = "failed"
+        # Nothing is persisted for a failed attempt (no CSVImport row is
+        # written) so the previous successful import unambiguously remains
+        # "the most recent CSVImport row" for GET /admin/current-import,
+        # and the previous active dataset is left completely untouched.
+        logger.error(
+            "CSV import FAILED (0 valid rows out of %s parsed) - previous active dataset preserved: "
+            "organization_slug=%s organization_id=%s",
+            rows_parsed, organization.slug, organization.id,
+        )
+        raise ValueError(
+            "Import produced zero valid alumni rows; aborting to protect the existing active dataset"
+        )
 
     try:
         csv_import_record = CSVImport(
@@ -682,6 +1044,48 @@ def import_alumni_csv(
         db.flush()
         summary.csv_import_id = csv_import_record.id
 
+        # --- REPLACE MODE ---
+        # This import's touched alumni become (or remain) the active
+        # dataset; everything else previously active for this organization
+        # is deactivated (never physically deleted). This makes the most
+        # recently uploaded CSV the complete, exclusive, authoritative
+        # dataset for the dashboard. is_active/source_import_id live on
+        # Alumni itself (not the per-organization link table).
+        if touched_alumni_ids:
+            db.query(Alumni).filter(Alumni.id.in_(touched_alumni_ids)).update(
+                {"is_active": True, "source_import_id": csv_import_record.id}, synchronize_session=False
+            )
+
+        org_alumni_ids = [
+            row[0]
+            for row in db.query(AlumniOrganization.alumni_id)
+            .filter(AlumniOrganization.organization_id == organization.id)
+            .all()
+        ]
+        archived_count = 0
+        if org_alumni_ids:
+            archived_query = db.query(Alumni).filter(
+                Alumni.id.in_(org_alumni_ids),
+                Alumni.is_active.is_(True),
+            )
+            if touched_alumni_ids:
+                archived_query = archived_query.filter(Alumni.id.notin_(touched_alumni_ids))
+            archived_count = archived_query.update({"is_active": False}, synchronize_session=False)
+        summary.archived = archived_count
+
+        active_count = (
+            db.query(Alumni)
+            .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id)
+            .filter(AlumniOrganization.organization_id == organization.id, Alumni.is_active.is_(True))
+            .count()
+        )
+        summary.active_database_total = active_count
+        summary.database_total = active_count
+
+        summary.historical_database_total = (
+            db.query(AlumniOrganization).filter(AlumniOrganization.organization_id == organization.id).count()
+        )
+
         record_audit_log(
             db,
             user_id=imported_by_user_id,
@@ -692,39 +1096,40 @@ def import_alumni_csv(
             details={
                 "created": summary.created,
                 "updated": summary.updated,
+                "unchanged": summary.unchanged,
+                "archived": summary.archived,
                 "failed": summary.failed,
+                "active_database_total": summary.active_database_total,
                 "filename": filename,
             },
         )
 
-        # The whole import (every row change + the CSVImport/AuditLog rows)
-        # is committed as a single transaction. If the commit itself fails
-        # for any reason, the transaction is rolled back so we never report
-        # success for a partially-applied import.
+        # The whole import (every row change + archiving + the
+        # CSVImport/AuditLog rows) is committed as a single transaction. If
+        # the commit itself fails for any reason, the transaction is rolled
+        # back so we never report success for a partially-applied import,
+        # and the previous active dataset remains untouched.
         db.commit()
     except Exception:
         db.rollback()
         logger.error(
             "CSV import FAILED and was rolled back: organization_slug=%s organization_id=%s "
-            "rows_parsed=%s created=%s updated=%s skipped=%s failed=%s transaction_committed=False",
+            "rows_parsed=%s created=%s updated=%s unchanged=%s failed=%s transaction_committed=False",
             organization.slug, organization.id, rows_parsed,
-            summary.created, summary.updated, summary.skipped, summary.failed,
+            summary.created, summary.updated, summary.unchanged, summary.failed,
         )
+        summary.status = "failed"
         raise
 
-    # Re-query the database (not in-memory counters) to confirm the import
-    # actually persisted, and report the organization's true current total.
-    summary.database_total = (
-        db.query(AlumniOrganization).filter(AlumniOrganization.organization_id == organization.id).count()
-    )
-
     logger.info(
-        "CSV import committed: organization_slug=%s organization_id=%s rows_parsed=%s "
-        "created=%s updated=%s skipped=%s failed=%s transaction_committed=True database_total=%s "
+        "CSV import committed: organization_slug=%s organization_id=%s rows_received=%s rows_valid=%s "
+        "rows_invalid=%s duplicate_rows=%s created=%s updated=%s unchanged=%s archived=%s failed=%s "
+        "transaction_committed=True active_database_total=%s "
         "rows_with_university=%s rows_with_job_title=%s rows_with_company=%s rows_with_location=%s",
-        organization.slug, organization.id, rows_parsed,
-        summary.created, summary.updated, summary.skipped, summary.failed,
-        summary.database_total, summary.rows_with_university, summary.rows_with_job_title,
+        organization.slug, organization.id, summary.csv_rows_received, summary.csv_rows_valid,
+        summary.csv_rows_invalid, summary.csv_duplicate_rows,
+        summary.created, summary.updated, summary.unchanged, summary.archived, summary.failed,
+        summary.active_database_total, summary.rows_with_university, summary.rows_with_job_title,
         summary.rows_with_company, summary.rows_with_location,
     )
     return summary

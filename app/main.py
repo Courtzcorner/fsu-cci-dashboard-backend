@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 validate_settings_for_production(settings)
 
+# Confirm the live process loaded replace-mode CSV import (not a stale
+# merge/upsert build). Paired with ImportResult.import_logic_version.
+from app.services.csv_import_service import IMPORT_LOGIC_VERSION  # noqa: E402
+
+logger.info("CSV replacement import logic %s loaded", IMPORT_LOGIC_VERSION)
+
 app = FastAPI(
     title="Alumni Dashboard API",
     description=(

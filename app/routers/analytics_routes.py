@@ -28,10 +28,16 @@ def get_analytics_summary(
     current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> AnalyticsSummary:
+    # Analytics are computed only from the currently active dataset (the
+    # latest successful CSV import) - alumni deactivated by superseded
+    # imports are excluded, matching /alumni-data exactly.
     records = (
         db.query(Alumni)
         .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id)
-        .filter(AlumniOrganization.organization_id == organization.id)
+        .filter(
+            AlumniOrganization.organization_id == organization.id,
+            Alumni.is_active.is_(True),
+        )
         .all()
     )
 

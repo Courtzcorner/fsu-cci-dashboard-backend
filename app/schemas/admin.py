@@ -8,16 +8,47 @@ class RowError(BaseModel):
 
 class ImportResult(BaseModel):
     organization: str
+    filename: str | None = None
     created: int
     updated: int
+    # Existing alumni row matched by this import but with no field changes.
+    unchanged: int = 0
+    # Previously-active alumni NOT present in this upload; deactivated
+    # (is_active=False), never physically deleted. "archived" is a legacy
+    # alias for the same count.
+    deactivated: int = 0
+    archived: int = 0
     skipped: int
     failed: int
-    # True count of this organization's alumni rows in the database,
-    # re-queried after commit - not an in-memory counter - so a caller
-    # can independently confirm the import actually persisted.
+    # Legacy alias for active_database_total, kept for backward compatibility.
+    # Always equals the ACTIVE dataset count after a successful replace-mode
+    # import - never the cumulative historical row count.
     database_total: int
+    # True count of ACTIVE alumni for this organization after this import
+    # (re-queried after commit, not an in-memory counter) - this is the
+    # single source of truth the dashboard/analytics must match exactly.
+    active_database_total: int = 0
+    # Total alumni_organizations rows for this organization regardless of
+    # is_active (includes archived history). Never use as the dashboard total.
+    historical_database_total: int = 0
     row_errors: list[RowError]
     csv_import_id: str | None = None
+    status: str = "complete"
+
+    # --- Import accounting (replace-mode single-dataset behavior) ---
+    # csv_physical_lines / csv_header_rows / csv_data_rows describe the raw
+    # uploaded file itself (e.g. 250 physical lines incl. 1 header -> 249
+    # data rows), independent of how many of those rows parsed cleanly.
+    csv_physical_lines: int = 0
+    csv_header_rows: int = 0
+    csv_data_rows: int = 0
+    csv_valid_rows: int = 0
+    csv_invalid_rows: int = 0
+    csv_duplicate_rows: int = 0
+    # Legacy aliases for the same counts, kept for backward compatibility.
+    csv_rows_received: int = 0
+    csv_rows_valid: int = 0
+    csv_rows_invalid: int = 0
 
     # --- Temporary CSV-mapping diagnostics ---
     # These make it possible to see, directly from the import response,
@@ -49,6 +80,31 @@ class ImportResult(BaseModel):
     selected_degree_column: str | None = None
     selected_major_column: str | None = None
     selected_graduation_year_column: str | None = None
+
+    # --- Duplicate-matching audit (temporary) ---
+    # One entry per newly created alumni row with normalized identifiers
+    # and why matching failed. Used to audit recurring create-on-reimport.
+    newly_created_identifiers: list[dict] = []
+    duplicate_candidates_found: int = 0
+    # Temporary deploy marker: must equal "replace-v2" when Render is
+    # running the new replacement import path.
+    import_logic_version: str = "replace-v2"
+
+
+class CurrentImportOut(BaseModel):
+    """Metadata describing the single authoritative dataset currently
+    powering the dashboard - i.e. the latest successfully committed CSV
+    import for the (single, default) organization."""
+
+    import_logic_version: str = "replace-v2"
+    csv_import_id: str | None = None
+    filename: str | None = None
+    uploaded_at: str | None = None
+    uploaded_by_user_id: str | None = None
+    csv_data_rows: int = 0
+    csv_rows_received: int = 0  # legacy alias for csv_data_rows
+    active_database_total: int = 0
+    status: str | None = None
 
 
 class NormalizeLocationsResult(BaseModel):

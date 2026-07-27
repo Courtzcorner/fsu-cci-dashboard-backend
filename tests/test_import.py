@@ -7,10 +7,12 @@ def _login(client, username, password):
     return client.post("/login", json={"username": username, "password": password}).json()["access_token"]
 
 
-def _upload(client, token, organization_slug, csv_text):
+def _upload(client, token, csv_text):
+    """POST /admin/import-alumni no longer accepts (or requires) an
+    organization field at all - there is only one dashboard/dataset, and
+    the admin cannot select or specify an organization."""
     return client.post(
         "/admin/import-alumni",
-        data={"organization": organization_slug},
         files={"file": ("alumni.csv", io.BytesIO(csv_text.encode("utf-8")), "text/csv")},
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -24,7 +26,7 @@ Maria,Gomez,2019,"Tallahassee, FL",,Reporter,WCTV
 
 def test_csv_import_creates_records(client, organization, admin_user, db_session):
     token = _login(client, "admin", "AdminPass123!")
-    response = _upload(client, token, "fsu-cci", CSV_BASIC)
+    response = _upload(client, token, CSV_BASIC)
     assert response.status_code == 200
 
     body = response.json()
@@ -43,14 +45,17 @@ def test_csv_import_creates_records(client, organization, admin_user, db_session
 
 def test_csv_import_prevents_duplicates_via_linkedin_url(client, organization, admin_user, db_session):
     token = _login(client, "admin", "AdminPass123!")
-    _upload(client, token, "fsu-cci", CSV_BASIC)
+    _upload(client, token, CSV_BASIC)
 
     updated_csv = CSV_BASIC.replace("Product Manager", "Senior Product Manager")
-    response = _upload(client, token, "fsu-cci", updated_csv)
+    response = _upload(client, token, updated_csv)
 
     body = response.json()
     assert body["created"] == 0
-    assert body["updated"] == 2
+    # Only Jordan's job title actually changed; Maria's row is identical
+    # to the first upload, so she counts as "unchanged", not "updated".
+    assert body["updated"] == 1
+    assert body["unchanged"] == 1
 
     records = db_session.query(Alumni).all()
     assert len(records) == 2
@@ -58,30 +63,42 @@ def test_csv_import_prevents_duplicates_via_linkedin_url(client, organization, a
     assert jordan.job_title == "Senior Product Manager"
 
 
-def test_csv_import_does_not_merge_on_name_alone(client, organization, admin_user, db_session):
+def test_csv_import_matches_on_name_alone_when_no_stronger_identifier_exists(
+    client, organization, admin_user, db_session
+):
+    """Under single-dataset "replace mode", the dedupe/match priority is
+    LinkedIn URL > email > first+last name - there is no longer a
+    graduation-year tiebreaker. The same name (no LinkedIn/email in either
+    upload) is treated as the same person and updated in place, and since
+    each upload is the complete authoritative dataset, only 1 row exists
+    (not 2) after the second upload."""
     token = _login(client, "admin", "AdminPass123!")
     csv_text = (
         "First Name,Last Name,Graduation Year,Location\n"
         "Jordan,Lee,2022,\"Brooklyn, NY\"\n"
     )
-    _upload(client, token, "fsu-cci", csv_text)
+    _upload(client, token, csv_text)
 
-    different_grad_year_csv = (
+    second_csv = (
         "First Name,Last Name,Graduation Year,Location\n"
         "Jordan,Lee,2010,\"Atlanta, GA\"\n"
     )
-    response = _upload(client, token, "fsu-cci", different_grad_year_csv)
+    response = _upload(client, token, second_csv)
     body = response.json()
-    assert body["created"] == 1
+    assert body["created"] == 0
+    assert body["updated"] == 1
+    assert body["active_database_total"] == 1
 
     records = db_session.query(Alumni).filter(Alumni.first_name == "Jordan").all()
-    assert len(records) == 2
+    assert len(records) == 1
+    assert records[0].graduation_year == 2010
+    assert records[0].city == "Atlanta"
 
 
 def test_csv_import_reports_row_errors_for_missing_required_fields(client, organization, admin_user):
     token = _login(client, "admin", "AdminPass123!")
     csv_text = "First Name,Last Name\n,\nJordan,Lee\n"
-    response = _upload(client, token, "fsu-cci", csv_text)
+    response = _upload(client, token, csv_text)
     body = response.json()
     assert body["failed"] == 1
     assert body["created"] == 1
@@ -90,17 +107,19 @@ def test_csv_import_reports_row_errors_for_missing_required_fields(client, organ
 
 def test_csv_import_requires_admin_role(client, organization, alumni_user):
     token = _login(client, "jdoe", "AlumniPass123!")
-    response = _upload(client, token, "fsu-cci", CSV_BASIC)
+    response = _upload(client, token, CSV_BASIC)
     assert response.status_code == 403
 
 
-def test_csv_import_defaults_to_fsu_cci_when_organization_field_is_omitted(client, organization, admin_user):
-    """organization: str = Form(default="fsu-cci") - omitting the form
-    field entirely must still import against fsu-cci, not fail/400."""
+def test_csv_import_works_without_an_organization_parameter(client, organization, admin_user):
+    """There is only one dashboard/dataset: the endpoint no longer accepts
+    an organization field at all, and always imports into the backend's
+    single configured default organization (fsu-cci)."""
     token = _login(client, "admin", "AdminPass123!")
     response = client.post(
         "/admin/import-alumni",
-        # No "organization" key in the form data at all.
+        # No "organization" key in the form data at all - and there is no
+        # way to send one that has any effect.
         files={"file": ("alumni.csv", io.BytesIO(CSV_BASIC.encode("utf-8")), "text/csv")},
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -109,7 +128,11 @@ def test_csv_import_defaults_to_fsu_cci_when_organization_field_is_omitted(clien
     assert response.json()["created"] == 2
 
 
-def test_csv_import_uses_submitted_organization_when_provided(client, admin_user, db_session):
+def test_csv_import_ignores_client_submitted_organization_field(client, organization, admin_user, db_session):
+    """The organization value must not be exposed as an admin choice: even
+    if a legacy/malicious client sends an "organization" form field, it is
+    silently ignored and the import always targets the single default
+    organization's dataset."""
     from app.models.organization import Organization
 
     other_org = Organization(name="STARS National", slug="stars-national")
@@ -117,17 +140,17 @@ def test_csv_import_uses_submitted_organization_when_provided(client, admin_user
     db_session.commit()
 
     token = _login(client, "admin", "AdminPass123!")
-    response = _upload(client, token, "stars-national", CSV_BASIC)
+    response = client.post(
+        "/admin/import-alumni",
+        data={"organization": "stars-national"},
+        files={"file": ("alumni.csv", io.BytesIO(CSV_BASIC.encode("utf-8")), "text/csv")},
+        headers={"Authorization": f"Bearer {token}"},
+    )
     assert response.status_code == 200
-    assert response.json()["organization"] == "stars-national"
+    assert response.json()["organization"] == "fsu-cci"
 
-
-def test_csv_import_rejects_unknown_organization_even_with_valid_admin(client, admin_user):
-    """The submitted form field alone never grants access - an admin
-    cannot import into an organization that doesn't exist in the database."""
-    token = _login(client, "admin", "AdminPass123!")
-    response = _upload(client, token, "does-not-exist", CSV_BASIC)
-    assert response.status_code == 404
+    records = db_session.query(Alumni).all()
+    assert len(records) == 2
 
 
 # --- Real-world header mapping (School Name, Current Job Title, etc.) ---
@@ -155,7 +178,7 @@ def test_csv_import_maps_real_world_headers_and_prefers_linkedin_columns(
     columns, and when multiple synonymous columns are present, the
     LinkedIn-sourced value must win per the documented priority order."""
     token = _login(client, "admin", "AdminPass123!")
-    response = _upload(client, token, "fsu-cci", CSV_REAL_HEADERS)
+    response = _upload(client, token, CSV_REAL_HEADERS)
     assert response.status_code == 200, response.text
 
     body = response.json()
@@ -188,7 +211,7 @@ def test_csv_import_get_alumni_data_returns_nonnull_fields(client, organization,
     """Regression guard for the reported bug: GET /alumni-data must not
     come back with nulls for fields the CSV clearly provided."""
     token = _login(client, "admin", "AdminPass123!")
-    _upload(client, token, "fsu-cci", CSV_REAL_HEADERS)
+    _upload(client, token, CSV_REAL_HEADERS)
 
     response = client.get("/alumni-data", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
@@ -213,7 +236,7 @@ def test_csv_import_does_not_erase_existing_values_with_blank_reimport(
         "First Name,Last Name,Graduation Year,Current Job Title,Current Employer,Location\n"
         'Morgan,Blake,2020,Data Analyst,Acme Corp,"Atlanta, GA"\n'
     )
-    _upload(client, token, "fsu-cci", full_csv)
+    _upload(client, token, full_csv)
 
     record = db_session.query(Alumni).filter(Alumni.first_name == "Morgan").one()
     assert record.job_title == "Data Analyst"
@@ -224,9 +247,11 @@ def test_csv_import_does_not_erase_existing_values_with_blank_reimport(
         "First Name,Last Name,Graduation Year,Current Job Title,Current Employer,Location\n"
         "Morgan,Blake,2020,,,\n"
     )
-    response = _upload(client, token, "fsu-cci", blank_followup_csv)
+    response = _upload(client, token, blank_followup_csv)
     assert response.status_code == 200
-    assert response.json()["updated"] == 1
+    # Blank CSV values never overwrite the existing nonblank values, so
+    # nothing actually changes on this row - it counts as "unchanged".
+    assert response.json()["unchanged"] == 1
 
     db_session.expire_all()
     record = db_session.query(Alumni).filter(Alumni.first_name == "Morgan").one()
@@ -249,7 +274,7 @@ def test_reimporting_same_file_fills_previously_null_fields_without_duplicating(
         "First Name,Last Name,Graduation Year,Some Unmapped Column\n"
         "Casey,Nguyen,2018,ignore-me\n"
     )
-    response = _upload(client, token, "fsu-cci", unmapped_csv)
+    response = _upload(client, token, unmapped_csv)
     assert response.json()["created"] == 1
     db_session.expire_all()
     record = db_session.query(Alumni).filter(Alumni.first_name == "Casey").one()
@@ -260,7 +285,7 @@ def test_reimporting_same_file_fills_previously_null_fields_without_duplicating(
         "First Name,Last Name,Graduation Year,Current Job Title,Current Employer,Location\n"
         'Casey,Nguyen,2018,Software Engineer,Globex,"Miami, FL"\n'
     )
-    response = _upload(client, token, "fsu-cci", real_csv)
+    response = _upload(client, token, real_csv)
     assert response.status_code == 200
     body = response.json()
     assert body["created"] == 0
@@ -274,9 +299,11 @@ def test_reimporting_same_file_fills_previously_null_fields_without_duplicating(
     assert record.company == "Globex"
     assert record.city == "Miami"
 
-    # Reimporting the exact same file again must not duplicate or regress.
-    response = _upload(client, token, "fsu-cci", real_csv)
-    assert response.json()["updated"] == 1
+    # Reimporting the exact same file again must not duplicate or regress -
+    # since nothing actually changed, it counts as "unchanged", not
+    # "updated".
+    response = _upload(client, token, real_csv)
+    assert response.json()["unchanged"] == 1
     db_session.expire_all()
     records = db_session.query(Alumni).filter(Alumni.first_name == "Casey").all()
     assert len(records) == 1
@@ -307,7 +334,7 @@ def test_reimport_fills_null_company_and_location_via_linkedin_columns(
         "First Name,Last Name,Graduation Year,LinkedIn Company,LinkedIn Location\n"
         'Riley,Chen,2019,Delta Analytics,"Denver, CO"\n'
     )
-    response = _upload(client, token, "fsu-cci", csv_text)
+    response = _upload(client, token, csv_text)
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["created"] == 0
@@ -340,7 +367,7 @@ def test_csv_import_maps_student_prefixed_and_existing_linkedin_headers(
     """Real dataset variant using 'Student Firstname/Lastname' plus the
     Existing/LinkedIn compound columns."""
     token = _login(client, "admin", "AdminPass123!")
-    response = _upload(client, token, "fsu-cci", CSV_STUDENT_HEADERS)
+    response = _upload(client, token, CSV_STUDENT_HEADERS)
     assert response.status_code == 200, response.text
 
     body = response.json()
@@ -384,7 +411,7 @@ def test_csv_import_uses_separate_city_state_columns_and_classifies_education_as
     column exists (only separate City/State), and "Education" holds an
     institution name (not a degree) - both must be handled correctly."""
     token = _login(client, "admin", "AdminPass123!")
-    response = _upload(client, token, "fsu-cci", CSV_CITY_STATE_AND_EDUCATION)
+    response = _upload(client, token, CSV_CITY_STATE_AND_EDUCATION)
     assert response.status_code == 200, response.text
 
     body = response.json()
@@ -438,7 +465,7 @@ def test_reimport_fills_previously_null_city_state_and_location(client, organiza
         "First Name,Last Name,Graduation Year,City,State\n"
         "Devon,Park,2021,Austin,TX\n"
     )
-    response = _upload(client, token, "fsu-cci", csv_text)
+    response = _upload(client, token, csv_text)
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["created"] == 0
@@ -451,10 +478,11 @@ def test_reimport_fills_previously_null_city_state_and_location(client, organiza
     assert record.state_code == "TX"
     assert record.location_original == "Austin, TX"
 
-    # A follow-up import with blank city/state must not erase these values.
+    # A follow-up import with blank city/state must not erase these values,
+    # and since nothing actually changed, it counts as "unchanged".
     blank_csv = "First Name,Last Name,Graduation Year,City,State\nDevon,Park,2021,,\n"
-    response = _upload(client, token, "fsu-cci", blank_csv)
-    assert response.json()["updated"] == 1
+    response = _upload(client, token, blank_csv)
+    assert response.json()["unchanged"] == 1
 
     db_session.expire_all()
     records = db_session.query(Alumni).filter(Alumni.first_name == "Devon").all()

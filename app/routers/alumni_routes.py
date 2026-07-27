@@ -16,7 +16,7 @@ router = APIRouter(tags=["alumni"])
 @router.get("/alumni-data", response_model=AlumniListResponse)
 def get_alumni_data(
     page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=5000),
+    page_size: int = Query(50, ge=1, le=200),
     graduation_year: Optional[int] = None,
     major: Optional[str] = None,
     industry: Optional[str] = None,
@@ -36,10 +36,17 @@ def get_alumni_data(
     valid Bearer token, and the caller must have been granted access to
     the requested organization (see app.deps.get_organization_by_slug_for_current_user).
     """
+    # Only alumni from the most recently uploaded ("replace mode") CSV
+    # import are ever returned - alumni deactivated by a newer upload are
+    # excluded so the dashboard always reflects exactly one authoritative,
+    # active dataset.
     query = (
         db.query(Alumni)
         .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id)
-        .filter(AlumniOrganization.organization_id == organization.id)
+        .filter(
+            AlumniOrganization.organization_id == organization.id,
+            Alumni.is_active.is_(True),
+        )
     )
 
     if graduation_year is not None:

@@ -6,15 +6,17 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
+from app.config import get_settings
 from app.database import get_db
 from app.deps import CurrentUser, get_current_user, require_admin_role
-from app.models.alumni import Alumni
+from app.models.alumni import Alumni, AlumniOrganization
+from app.models.audit import CSVImport
 from app.models.legal_name import LegalNameChangeRequest
 from app.models.organization import Organization
-from app.schemas.admin import ImportResult, NormalizeLocationsResult, RowError
+from app.schemas.admin import CurrentImportOut, ImportResult, NormalizeLocationsResult, RowError
 from app.schemas.profile import LegalNameChangeRequestOut
 from app.services.audit_service import record_audit_log
-from app.services.csv_import_service import import_alumni_csv
+from app.services.csv_import_service import IMPORT_LOGIC_VERSION, import_alumni_csv
 from app.services.location_reprocess_service import reprocess_locations
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -27,19 +29,36 @@ def _resolve_organization(db: Session, slug: str) -> Organization:
     return organization
 
 
+def _get_default_organization(db: Session) -> Organization:
+    """The product exposes a single dashboard/dataset: the admin never
+    selects or submits an organization. Internally this still resolves to
+    the configured default organization slug (kept for architectural
+    compatibility), but that value is never taken from client input.
+    """
+    return _resolve_organization(db, get_settings().default_organization_slug)
+
+
 @router.post("/import-alumni", response_model=ImportResult)
 async def import_alumni(
-    organization: str = Form(default="fsu-cci"),
     file: UploadFile = File(...),
     current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ImportResult:
-    # Admin role is checked first, then the requested organization slug is
-    # authorized/resolved against the database - the submitted form field
-    # alone never grants access to an organization that doesn't exist or
-    # that this deployment doesn't manage.
+    """Live CSV import path (replace-v2):
+
+    router: app.routers.admin_routes.import_alumni
+      -> service: app.services.csv_import_service.import_alumni_csv
+      -> transaction: single db.commit() after create/update + deactivate
+      -> final count: Alumni.is_active == True for this organization
+
+    There is no legacy merge/upsert import function wired to this route:
+    every successful import replaces the organization's active dataset.
+    """
+    # There is only one dashboard/dataset: the admin does not - and cannot -
+    # choose an organization. This always imports into (and replaces) the
+    # backend's single configured default organization's dataset.
     require_admin_role(current_user)
-    organization_record = _resolve_organization(db, organization)
+    organization_record = _get_default_organization(db)
 
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .csv files are accepted")
@@ -52,25 +71,45 @@ async def import_alumni(
         )
     except Exception:
         # import_alumni_csv already rolled back its own transaction on
-        # failure; nothing was committed, so no partial import is visible
-        # to anyone. Never report success for a failed import.
+        # failure; nothing was committed, so the previous active dataset
+        # remains fully intact. Never report success for a failed import.
         logger.exception(
-            "CSV import failed for organization=%s; transaction rolled back", organization_record.slug
+            "CSV import failed for organization=%s; transaction rolled back, previous active dataset preserved",
+            organization_record.slug,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Import failed and was rolled back. No records were changed.",
+            detail="Import failed and was rolled back. The previously active dataset is unchanged.",
         )
 
     return ImportResult(
         organization=organization_record.slug,
+        filename=summary.filename,
         created=summary.created,
         updated=summary.updated,
+        unchanged=summary.unchanged,
         skipped=summary.skipped,
         failed=summary.failed,
-        database_total=summary.database_total,
+        deactivated=summary.archived,
+        archived=summary.archived,
+        # Deprecated: kept only for backward compatibility. Always equals
+        # active_database_total - never the cumulative historical count.
+        database_total=summary.active_database_total,
+        active_database_total=summary.active_database_total,
+        historical_database_total=summary.historical_database_total,
         row_errors=[RowError(**e) for e in summary.row_errors],
         csv_import_id=summary.csv_import_id,
+        status=summary.status,
+        import_logic_version=summary.import_logic_version,
+        csv_physical_lines=summary.csv_physical_lines,
+        csv_header_rows=summary.csv_header_rows,
+        csv_data_rows=summary.csv_data_rows,
+        csv_valid_rows=summary.csv_valid_rows,
+        csv_invalid_rows=summary.csv_invalid_rows,
+        csv_duplicate_rows=summary.csv_duplicate_rows,
+        csv_rows_received=summary.csv_rows_received,
+        csv_rows_valid=summary.csv_rows_valid,
+        csv_rows_invalid=summary.csv_rows_invalid,
         recognized_headers=summary.recognized_headers,
         unrecognized_headers=summary.unrecognized_headers,
         rows_with_graduation_year=summary.rows_with_graduation_year,
@@ -94,6 +133,53 @@ async def import_alumni(
         selected_degree_column=summary.selected_degree_column,
         selected_major_column=summary.selected_major_column,
         selected_graduation_year_column=summary.selected_graduation_year_column,
+        newly_created_identifiers=summary.newly_created_identifiers,
+        duplicate_candidates_found=summary.duplicate_candidates_found,
+    )
+
+
+@router.get("/current-import", response_model=CurrentImportOut)
+def get_current_import(
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CurrentImportOut:
+    """Metadata for the single dataset currently powering the dashboard -
+    the latest successfully committed CSV import. Only successful imports
+    ever write a CSVImport row, so "most recent by created_at" is always
+    "most recent successful" - a failed import never appears here and
+    never changes what this endpoint reports. Any authenticated user
+    (admin or alumni) may check this, mirroring read access to
+    /alumni-data.
+    """
+    organization_record = _get_default_organization(db)
+
+    active_total = (
+        db.query(Alumni)
+        .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id)
+        .filter(AlumniOrganization.organization_id == organization_record.id, Alumni.is_active.is_(True))
+        .count()
+    )
+
+    latest_import = (
+        db.query(CSVImport)
+        .filter(CSVImport.organization_id == organization_record.id)
+        .order_by(CSVImport.created_at.desc())
+        .first()
+    )
+    if latest_import is None:
+        return CurrentImportOut(
+            import_logic_version=IMPORT_LOGIC_VERSION,
+            active_database_total=active_total,
+            status="none",
+        )
+
+    return CurrentImportOut(
+        import_logic_version=IMPORT_LOGIC_VERSION,
+        csv_import_id=latest_import.id,
+        filename=latest_import.filename,
+        uploaded_at=latest_import.created_at.isoformat() if latest_import.created_at else None,
+        active_database_total=active_total,
+        status="complete",
     )
 
 

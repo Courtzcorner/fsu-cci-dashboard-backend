@@ -1,7 +1,10 @@
+import csv
+import io
 import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -18,6 +21,17 @@ from app.schemas.profile import LegalNameChangeRequestOut
 from app.services.audit_service import record_audit_log
 from app.services.csv_import_service import IMPORT_LOGIC_VERSION, import_alumni_csv
 from app.services.location_reprocess_service import reprocess_locations
+
+EXPORT_COLUMNS = [
+    "First Name", "Last Name", "Email", "LinkedIn URL", "Company Name", "Job Title",
+    "City", "State", "Education", "Verification Status", "Verification Date",
+    "Industry", "Industry Source", "Career Category", "Career Category Source",
+    "Seniority", "Seniority Source",
+]
+# Batch size used for the keyset-paginated export query below - keeps
+# memory bounded (~batch_size rows in memory at a time) no matter how
+# large the active dataset is (75,000+ rows).
+EXPORT_BATCH_SIZE = 1000
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -110,6 +124,12 @@ async def import_alumni(
         csv_rows_received=summary.csv_rows_received,
         csv_rows_valid=summary.csv_rows_valid,
         csv_rows_invalid=summary.csv_rows_invalid,
+        # Canonical short names - always reflect this actual upload
+        # (never hardcoded).
+        rows_received=summary.csv_rows_received,
+        rows_valid=summary.csv_rows_valid,
+        rows_invalid=summary.csv_rows_invalid,
+        duplicate_rows=summary.csv_duplicate_rows,
         recognized_headers=summary.recognized_headers,
         unrecognized_headers=summary.unrecognized_headers,
         rows_with_graduation_year=summary.rows_with_graduation_year,
@@ -173,13 +193,98 @@ def get_current_import(
             status="none",
         )
 
+    imported_at = latest_import.created_at.isoformat() if latest_import.created_at else None
     return CurrentImportOut(
         import_logic_version=IMPORT_LOGIC_VERSION,
         csv_import_id=latest_import.id,
         filename=latest_import.filename,
-        uploaded_at=latest_import.created_at.isoformat() if latest_import.created_at else None,
+        uploaded_at=imported_at,
+        imported_at=imported_at,
+        csv_data_rows=latest_import.rows_received,
+        csv_rows_received=latest_import.rows_received,
+        rows_received=latest_import.rows_received,
+        rows_valid=latest_import.rows_valid,
+        rows_invalid=latest_import.rows_invalid,
         active_database_total=active_total,
         status="complete",
+    )
+
+
+def _active_alumni_export_query(db: Session, organization_id: str):
+    return (
+        db.query(Alumni)
+        .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id)
+        .filter(AlumniOrganization.organization_id == organization_id, Alumni.is_active.is_(True))
+    )
+
+
+def _export_row(alumni: Alumni) -> list:
+    return [
+        alumni.first_name,
+        alumni.last_name,
+        alumni.email,
+        alumni.linkedin_url,
+        alumni.company,
+        alumni.job_title,
+        alumni.city,
+        alumni.state,
+        alumni.university,
+        alumni.verification_status,
+        alumni.verification_date.isoformat() if alumni.verification_date else "",
+        alumni.industry,
+        alumni.industry_source,
+        alumni.career_category,
+        alumni.career_category_source,
+        alumni.seniority,
+        alumni.seniority_source,
+    ]
+
+
+@router.get("/export-alumni")
+def export_alumni(
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """Streams the current active dataset (imported CSV columns plus
+    every backend-derived column and its provenance) as a CSV download.
+    Never overwrites imported source values - `industry`/`career_category`/
+    `seniority` here are exactly what's stored on each Alumni row, and each
+    has its own `*_source` column (imported / derived:title_rules /
+    company_mapping / unknown) alongside it.
+
+    Rows are fetched in keyset-paginated batches (ordered by id, not
+    OFFSET) so a 75,000-row export never materializes the full dataset in
+    memory at once.
+    """
+    require_admin_role(current_user)
+    organization_record = _get_default_organization(db)
+    base_query = _active_alumni_export_query(db, organization_record.id)
+
+    def generate():
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(EXPORT_COLUMNS)
+        yield buffer.getvalue()
+
+        last_id: str | None = None
+        while True:
+            buffer.seek(0)
+            buffer.truncate(0)
+            query = base_query.order_by(Alumni.id.asc())
+            if last_id is not None:
+                query = query.filter(Alumni.id > last_id)
+            batch = query.limit(EXPORT_BATCH_SIZE).all()
+            if not batch:
+                break
+            for alumni in batch:
+                writer.writerow(_export_row(alumni))
+                last_id = alumni.id
+            yield buffer.getvalue()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=alumni_export.csv"},
     )
 
 

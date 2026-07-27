@@ -23,6 +23,12 @@ class CSVImport(Base, UUIDPrimaryKeyMixin):
     updated_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     skipped_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Raw row accounting from the uploaded file itself, persisted so GET
+    # /admin/current-import can report the dataset's provenance long after
+    # the original import response was returned.
+    rows_received: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    rows_valid: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    rows_invalid: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     row_errors_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     imported_by_user_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True

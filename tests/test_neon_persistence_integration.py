@@ -49,8 +49,11 @@ def test_full_import_and_shared_read_persistence_flow(client, admin_user, alumni
     assert import_body["updated"] == 0
     assert import_body["skipped"] == 0
     assert import_body["failed"] == 0
-    # alumni_user fixture already has 1 record in fsu-cci, plus the 3 just imported.
-    assert import_body["database_total"] == 4
+    # Replace-mode: the alumni_user fixture's pre-existing record is not
+    # present in this CSV, so it is deactivated (never physically deleted)
+    # and the active dataset becomes exactly these 3 imported rows.
+    assert import_body["database_total"] == 3
+    assert import_body["active_database_total"] == 3
 
     # 3. Open a brand new SQLAlchemy session (not the request-scoped one
     #    used by the endpoints) and confirm the rows are actually there.
@@ -77,7 +80,7 @@ def test_full_import_and_shared_read_persistence_flow(client, admin_user, alumni
     assert admin_read.status_code == 200
     admin_body = admin_read.json()
     assert admin_body["meta"]["organization"] == "fsu-cci"
-    assert admin_body["meta"]["total"] == 4
+    assert admin_body["meta"]["total"] == 3
     admin_names = {row["full_name"] for row in admin_body["data"]}
 
     # 5. Call GET /alumni-data as a different, newly-authenticated alumni user.
@@ -95,7 +98,7 @@ def test_full_import_and_shared_read_persistence_flow(client, admin_user, alumni
     #    filtering, no separate admin/alumni copies of the dataset.
     assert admin_names == alumni_names
     assert {"Jordan Lee", "Maria Gomez", "Sam Osei"}.issubset(alumni_names)
-    assert admin_body["meta"]["total"] == alumni_body["meta"]["total"] == 4
+    assert admin_body["meta"]["total"] == alumni_body["meta"]["total"] == 3
 
     # Every row returned must be usable by the frontend without additional
     # lookups (map, directory, companies/industries/universities/seniority
@@ -114,6 +117,10 @@ def test_full_import_and_shared_read_persistence_flow(client, admin_user, alumni
     engine.dispose()
     verification_session = SessionLocal()
     try:
+        # Historical total (active + deactivated) - nothing is physically
+        # deleted by replace-mode, so this still includes the alumni_user
+        # fixture's now-inactive pre-existing record alongside the 3
+        # newly-imported active rows.
         final_count = (
             verification_session.query(Alumni)
             .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id)
@@ -121,6 +128,13 @@ def test_full_import_and_shared_read_persistence_flow(client, admin_user, alumni
             .count()
         )
         assert final_count == 4
+        final_active_count = (
+            verification_session.query(Alumni)
+            .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id)
+            .filter(AlumniOrganization.organization_id == organization.id, Alumni.is_active.is_(True))
+            .count()
+        )
+        assert final_active_count == 3
     finally:
         verification_session.close()
 

@@ -45,6 +45,9 @@ class Alumni(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     verification_status: Mapped[str] = mapped_column(String(32), default="unverified", nullable=False)
     verification_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
+    # Free-text "Notes" column carried through verbatim from the CSV.
+    notes: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+
     # Used (in priority order, after normalized LinkedIn URL) to match a CSV
     # row to an existing alumni record during import, so reimporting the
     # same file never creates duplicates.

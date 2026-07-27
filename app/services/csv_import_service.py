@@ -33,7 +33,7 @@ from app.models.audit import CSVImport
 from app.models.organization import Organization
 from app.models.reference import Company, Industry, University
 from app.services.audit_service import record_audit_log
-from app.services.classification_service import classify_alumni_fields
+from app.services.classification_service import build_company_industry_map, classify_alumni_fields
 from app.services.location_normalization_service import normalize_city_state, normalize_location
 
 logger = logging.getLogger(__name__)
@@ -157,6 +157,7 @@ FIELD_ALIASES: dict[str, list[str]] = {
     "employment_tenure": ["employment_tenure", "tenure"],
     "employment_type": ["employment_type", "job_type"],
     "email": ["email"],
+    "notes": ["notes", "note", "comments", "comment"],
 }
 
 # Note: "profile_headline", "employment_tenure", "employment_type", and
@@ -541,16 +542,32 @@ def _build_alumni_match_index(db: Session, organization_id: str) -> _AlumniMatch
     return index
 
 
-def _get_or_create_reference(db: Session, model, organization_id: str, name: str | None, cache: dict) -> None:
+def _preload_reference_names(db: Session, model, organization_id: str) -> set[str]:
+    """Loads every existing reference-table name (Company/Industry/
+    University) ONCE per import, so `_get_or_create_reference` below never
+    issues a per-row SELECT - the single biggest N+1 pattern in this
+    pipeline, and the one that would make a 75k-row import prohibitively
+    slow.
+    """
+    return {
+        name.strip().lower()
+        for (name,) in db.query(model.name).filter(model.organization_id == organization_id).all()
+    }
+
+
+def _get_or_create_reference(
+    db: Session, model, organization_id: str, name: str | None, known_names: set[str], cache: dict
+) -> None:
     if not name:
         return
     key = (model, name.strip().lower())
     if key in cache:
         return
-    existing = db.query(model).filter(model.organization_id == organization_id, model.name == name).first()
-    if existing is None:
-        db.add(model(organization_id=organization_id, name=name))
     cache[key] = True
+    if name.strip().lower() in known_names:
+        return
+    db.add(model(organization_id=organization_id, name=name))
+    known_names.add(name.strip().lower())
 
 
 def _compute_profile_completion(effective: dict) -> int:
@@ -573,6 +590,14 @@ def import_alumni_csv(
     summary.filename = filename
     summary.import_logic_version = IMPORT_LOGIC_VERSION
     reference_cache: dict = {}
+    # Preloaded ONCE per import (not once per row) to eliminate the N+1
+    # SELECT pattern that would otherwise make large (e.g. 75,000-row)
+    # imports scale linearly with row count instead of with distinct
+    # company/industry/university names.
+    known_companies = _preload_reference_names(db, Company, organization.id)
+    known_industries = _preload_reference_names(db, Industry, organization.id)
+    known_universities = _preload_reference_names(db, University, organization.id)
+    company_industry_map = build_company_industry_map(db, organization.id)
     logger.info(
         "CSV replacement import logic %s executing for organization_slug=%s filename=%s",
         IMPORT_LOGIC_VERSION,
@@ -787,6 +812,7 @@ def import_alumni_csv(
                 existing_industry=resolved.get("industry"),
                 existing_career_category=resolved.get("career_category"),
                 existing_seniority=resolved.get("seniority"),
+                company_industry_map=company_industry_map,
             )
             # Only keep classification keys that actually resolved to a
             # nonblank value - a miss (None) must never overwrite an
@@ -839,6 +865,8 @@ def import_alumni_csv(
                 field_values["linkedin_url"] = linkedin_url
             if email:
                 field_values["email"] = _normalize_email(email)
+            if resolved.get("notes"):
+                field_values["notes"] = resolved["notes"]
             field_values.update(location_fields)
             field_values.update(classification)
 
@@ -983,9 +1011,19 @@ def import_alumni_csv(
             if constructed_from_city_state and location_fields.get("location_original"):
                 summary.rows_with_constructed_location += 1
 
-            _get_or_create_reference(db, Company, organization.id, company, reference_cache)
-            _get_or_create_reference(db, Industry, organization.id, field_values.get("industry"), reference_cache)
-            _get_or_create_reference(db, University, organization.id, field_values.get("university"), reference_cache)
+            _get_or_create_reference(db, Company, organization.id, company, known_companies, reference_cache)
+            _get_or_create_reference(
+                db, Industry, organization.id, field_values.get("industry"), known_industries, reference_cache
+            )
+            _get_or_create_reference(
+                db, University, organization.id, field_values.get("university"), known_universities, reference_cache
+            )
+
+            # Bounded per-import memory: periodically flush pending
+            # inserts/updates rather than holding 75,000 objects in the
+            # SQLAlchemy identity map for the entire import.
+            if row_index % 500 == 0:
+                db.flush()
 
             record_audit_log(
                 db,
@@ -1037,6 +1075,9 @@ def import_alumni_csv(
             updated_count=summary.updated,
             skipped_count=summary.skipped,
             failed_count=summary.failed,
+            rows_received=summary.csv_rows_received,
+            rows_valid=summary.csv_rows_valid,
+            rows_invalid=summary.csv_rows_invalid,
             row_errors_json=json.dumps(summary.row_errors) if summary.row_errors else None,
             imported_by_user_id=imported_by_user_id,
         )

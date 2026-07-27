@@ -16,9 +16,10 @@ router = APIRouter(tags=["alumni"])
 @router.get("/alumni-data", response_model=AlumniListResponse)
 def get_alumni_data(
     page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=200),
+    page_size: int = Query(50, ge=1, le=5000),
     graduation_year: Optional[int] = None,
     major: Optional[str] = None,
+    university: Optional[str] = None,
     industry: Optional[str] = None,
     career_category: Optional[str] = None,
     seniority: Optional[str] = None,
@@ -53,6 +54,8 @@ def get_alumni_data(
         query = query.filter(Alumni.graduation_year == graduation_year)
     if major:
         query = query.filter(Alumni.major.ilike(f"%{major}%"))
+    if university:
+        query = query.filter(Alumni.university.ilike(f"%{university}%"))
     if industry:
         query = query.filter(Alumni.industry.ilike(f"%{industry}%"))
     if career_category:
@@ -122,7 +125,10 @@ def get_alumni_data(
         for record in records
     ]
 
+    total_pages = (total + page_size - 1) // page_size if total else 0
     return AlumniListResponse(
         data=data,
-        meta=AlumniListMeta(organization=organization.slug, total=total, page=page, page_size=page_size),
+        meta=AlumniListMeta(
+            organization=organization.slug, total=total, page=page, page_size=page_size, total_pages=total_pages
+        ),
     )

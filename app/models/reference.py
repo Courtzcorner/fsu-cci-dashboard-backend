@@ -21,6 +21,12 @@ class Company(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # An optional, admin-verified company -> industry mapping. Never set by
+    # AI/keyword inference - only by direct assignment (e.g. an admin
+    # maintenance tool) or a documented deterministic mapping. Used as the
+    # second-priority industry source (after a nonblank imported "Industry"
+    # column) in app.services.classification_service.
+    industry: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class Industry(Base, UUIDPrimaryKeyMixin, TimestampMixin):

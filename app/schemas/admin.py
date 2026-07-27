@@ -49,6 +49,12 @@ class ImportResult(BaseModel):
     csv_rows_received: int = 0
     csv_rows_valid: int = 0
     csv_rows_invalid: int = 0
+    # Canonical short names (dynamic - always reflect the actual uploaded
+    # file, never hardcoded).
+    rows_received: int = 0
+    rows_valid: int = 0
+    rows_invalid: int = 0
+    duplicate_rows: int = 0
 
     # --- Temporary CSV-mapping diagnostics ---
     # These make it possible to see, directly from the import response,
@@ -100,9 +106,13 @@ class CurrentImportOut(BaseModel):
     csv_import_id: str | None = None
     filename: str | None = None
     uploaded_at: str | None = None
+    imported_at: str | None = None  # alias for uploaded_at
     uploaded_by_user_id: str | None = None
     csv_data_rows: int = 0
     csv_rows_received: int = 0  # legacy alias for csv_data_rows
+    rows_received: int = 0
+    rows_valid: int = 0
+    rows_invalid: int = 0
     active_database_total: int = 0
     status: str | None = None
 

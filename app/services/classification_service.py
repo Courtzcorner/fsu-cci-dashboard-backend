@@ -1,51 +1,69 @@
 """
-Optional classification inference for industry / career_category / seniority
-when those fields are blank in the imported spreadsheet.
+Deterministic classification rules for `seniority`, `career_category`, and
+`industry`.
 
-Imported values always take priority and are tagged `imported`. Inference
-here is a best-effort fallback tagged `inferred` so downstream consumers
-(especially analytics) can distinguish confirmed data from guesses. The
-frontend may show inferred values as a temporary fallback, but this service
-- and the `*_source` columns it sets - is the backend's official record of
-provenance.
+Nothing here is an AI/ML guess. Every derived value comes from an explicit,
+documented, ordered rule list matched against the job title (or, for
+industry, a verified company mapping) - the same input always produces the
+same output. Every value is tagged with a `*_source` column so downstream
+consumers (analytics, exports) can always tell confirmed CSV data from
+backend-derived data:
+
+- "imported"        - came directly from a nonblank CSV column
+- "derived:title_rules" - matched one of the documented keyword rules below
+- "company_mapping" - matched a verified Company.industry mapping
+- "unknown"         - no rule matched; the value is null/"Unclassified",
+                       never guessed
 """
+import re
 from dataclasses import dataclass
 from typing import Optional
 
+from sqlalchemy.orm import Session
+
+from app.models.reference import Company
 from app.models.roles import DataSource
 
-SENIORITY_KEYWORDS: list[tuple[str, str]] = [
-    ("chief", "Executive"), ("ceo", "Executive"), ("cfo", "Executive"), ("cto", "Executive"),
-    ("founder", "Executive"), ("president", "Executive"), ("vp", "Vice President"),
-    ("vice president", "Vice President"), ("director", "Director"), ("head of", "Director"),
-    ("senior manager", "Manager"), ("manager", "Manager"), ("lead", "Senior"),
-    ("senior", "Senior"), ("principal", "Senior"), ("staff", "Senior"),
-    ("associate", "Associate"), ("junior", "Entry Level"), ("intern", "Entry Level"),
-    ("coordinator", "Entry Level"), ("assistant", "Entry Level"),
+SENIORITY_SOURCE = "derived:title_rules"
+CAREER_CATEGORY_SOURCE = "derived:title_rules"
+COMPANY_MAPPING_SOURCE = "company_mapping"
+
+UNCLASSIFIED = "Unclassified"
+
+# Ordered MOST SPECIFIC FIRST. A title is classified by the first rule it
+# matches, so "Senior Vice President of Engineering" resolves to "Vice
+# President" (checked before the generic "senior" rule), and "Chief
+# Marketing Officer" resolves to "Executive" (checked before "manager" /
+# "director", even though "officer" titles often also contain those words).
+SENIORITY_RULES: list[tuple[str, tuple[str, ...]]] = [
+    ("Executive", ("chief", "ceo", "cto", "cio", "cmo", "coo", "cfo", "founder")),
+    ("Vice President", ("vice president", "vp")),
+    ("Director", ("director", "head")),
+    ("Manager", ("manager",)),
+    ("Lead", ("lead", "principal")),
+    ("Senior", ("senior", "sr")),
+    ("Associate", ("associate",)),
+    ("Entry", ("assistant", "coordinator")),
+    ("Intern", ("intern",)),
 ]
 
-INDUSTRY_KEYWORDS: list[tuple[str, str]] = [
-    ("bank", "Financial Services"), ("financ", "Financial Services"), ("capital", "Financial Services"),
-    ("software", "Technology"), ("technology", "Technology"), ("tech", "Technology"),
-    ("media", "Media & Entertainment"), ("broadcast", "Media & Entertainment"),
-    ("news", "Media & Entertainment"), ("entertainment", "Media & Entertainment"),
-    ("hospital", "Healthcare"), ("health", "Healthcare"), ("pharma", "Healthcare"),
-    ("university", "Education"), ("school", "Education"), ("education", "Education"),
-    ("government", "Government"), ("public sector", "Government"),
-    ("consult", "Consulting"), ("nonprofit", "Nonprofit"), ("non-profit", "Nonprofit"),
-    ("retail", "Retail"), ("manufactur", "Manufacturing"), ("marketing", "Marketing & Advertising"),
-    ("advertis", "Marketing & Advertising"), ("real estate", "Real Estate"),
-]
-
-CAREER_CATEGORY_KEYWORDS: list[tuple[str, str]] = [
-    ("engineer", "Engineering"), ("developer", "Engineering"), ("product manager", "Product Management"),
-    ("product", "Product Management"), ("marketing", "Marketing"), ("communications", "Communications"),
-    ("pr ", "Public Relations"), ("public relations", "Public Relations"), ("sales", "Sales"),
-    ("account manager", "Sales"), ("finance", "Finance"), ("accounting", "Finance"),
-    ("human resources", "Human Resources"), ("hr ", "Human Resources"), ("design", "Design"),
-    ("editor", "Editorial"), ("journalist", "Editorial"), ("reporter", "Editorial"),
-    ("teacher", "Education"), ("professor", "Education"), ("operations", "Operations"),
-    ("data", "Data & Analytics"), ("analyst", "Data & Analytics"),
+# Ordered; documented keyword -> career category. First match wins.
+CAREER_CATEGORY_RULES: list[tuple[str, tuple[str, ...]]] = [
+    ("Engineering", ("engineer", "developer", "engineering")),
+    ("Product Management", ("product manager", "product owner", "product")),
+    ("Data & Analytics", ("data scientist", "data analyst", "data engineer", "analyst", "data")),
+    ("Design", ("designer", "ux", "ui", "design")),
+    ("Marketing", ("marketing",)),
+    ("Communications", ("communications",)),
+    ("Public Relations", ("public relations", "pr")),
+    ("Sales", ("sales", "account manager", "account executive")),
+    ("Finance", ("finance", "accounting", "accountant", "financial")),
+    ("Human Resources", ("human resources", "hr", "recruiter")),
+    ("Editorial", ("editor", "journalist", "reporter", "writer")),
+    ("Education", ("teacher", "professor", "instructor", "educator")),
+    ("Operations", ("operations",)),
+    ("Legal", ("attorney", "counsel", "paralegal", "legal")),
+    ("Consulting", ("consultant", "consulting")),
 ]
 
 
@@ -55,39 +73,81 @@ class ClassificationResult:
     source: str
 
 
-def _match_keywords(text: str, keywords: list[tuple[str, str]]) -> Optional[str]:
-    lowered = text.lower()
-    for keyword, label in keywords:
-        if keyword in lowered:
+def _keyword_pattern(keyword: str) -> "re.Pattern":
+    # \b word-boundary matching so short keywords like "vp" or "sr" never
+    # match inside a longer, unrelated word (e.g. "coo" inside
+    # "coordinator", or "lead" inside "leadership development").
+    escaped = re.escape(keyword.strip())
+    return re.compile(rf"\b{escaped}\b")
+
+
+def _first_matching_rule(text: str, rules: list[tuple[str, tuple[str, ...]]]) -> Optional[str]:
+    lowered = text.strip().lower()
+    for label, keywords in rules:
+        if any(_keyword_pattern(keyword).search(lowered) for keyword in keywords):
             return label
     return None
 
 
-def infer_seniority(job_title: Optional[str]) -> ClassificationResult:
-    if not job_title:
+def derive_seniority(job_title: Optional[str]) -> ClassificationResult:
+    """Deterministic title -> seniority mapping. See SENIORITY_RULES for
+    the full documented rule order. Never guesses: an unmatched title
+    always resolves to (None, "unknown")."""
+    if not job_title or not job_title.strip():
         return ClassificationResult(value=None, source=DataSource.UNKNOWN.value)
-    match = _match_keywords(job_title, SENIORITY_KEYWORDS)
+    match = _first_matching_rule(job_title, SENIORITY_RULES)
     if match:
-        return ClassificationResult(value=match, source=DataSource.INFERRED.value)
+        return ClassificationResult(value=match, source=SENIORITY_SOURCE)
     return ClassificationResult(value=None, source=DataSource.UNKNOWN.value)
 
 
-def infer_industry(company: Optional[str], job_title: Optional[str]) -> ClassificationResult:
-    combined = " ".join(filter(None, [company, job_title]))
-    if not combined.strip():
+def derive_career_category(job_title: Optional[str]) -> ClassificationResult:
+    """Deterministic title -> career category mapping. See
+    CAREER_CATEGORY_RULES for the full documented rule order."""
+    if not job_title or not job_title.strip():
         return ClassificationResult(value=None, source=DataSource.UNKNOWN.value)
-    match = _match_keywords(combined, INDUSTRY_KEYWORDS)
+    match = _first_matching_rule(job_title, CAREER_CATEGORY_RULES)
     if match:
-        return ClassificationResult(value=match, source=DataSource.INFERRED.value)
+        return ClassificationResult(value=match, source=CAREER_CATEGORY_SOURCE)
     return ClassificationResult(value=None, source=DataSource.UNKNOWN.value)
 
 
-def infer_career_category(job_title: Optional[str]) -> ClassificationResult:
-    if not job_title:
-        return ClassificationResult(value=None, source=DataSource.UNKNOWN.value)
-    match = _match_keywords(job_title, CAREER_CATEGORY_KEYWORDS)
-    if match:
-        return ClassificationResult(value=match, source=DataSource.INFERRED.value)
+def build_company_industry_map(db: Session, organization_id: str) -> dict[str, str]:
+    """Preloads the verified company -> industry mapping ONCE per import
+    (not once per row) to avoid an N+1 query pattern against `companies`.
+    Only companies with an explicitly assigned `industry` value (never an
+    AI guess - see app.models.reference.Company.industry) are included.
+    """
+    rows = (
+        db.query(Company.name, Company.industry)
+        .filter(Company.organization_id == organization_id, Company.industry.isnot(None))
+        .all()
+    )
+    return {name.strip().lower(): industry for name, industry in rows if name and industry}
+
+
+def resolve_industry(
+    company: Optional[str],
+    imported_industry: Optional[str],
+    company_industry_map: Optional[dict[str, str]] = None,
+) -> ClassificationResult:
+    """Resolve industry using ONLY deterministic sources, in priority
+    order - industry is NEVER guessed from a company name via keywords or
+    an AI model:
+
+    1. A nonblank imported "Industry" CSV column for this row.
+    2. A verified company -> industry mapping (Company.industry) for this
+       organization, matched case-insensitively by company name.
+    3. Unclassified (None, source="unknown").
+    """
+    if imported_industry and imported_industry.strip():
+        return ClassificationResult(value=imported_industry.strip(), source=DataSource.IMPORTED.value)
+
+    if company and company_industry_map:
+        mapped = company_industry_map.get(company.strip().lower())
+        if mapped:
+            return ClassificationResult(value=mapped, source=COMPANY_MAPPING_SOURCE)
+
     return ClassificationResult(value=None, source=DataSource.UNKNOWN.value)
 
 
@@ -97,34 +157,33 @@ def classify_alumni_fields(
     existing_industry: Optional[str],
     existing_career_category: Optional[str],
     existing_seniority: Optional[str],
+    company_industry_map: Optional[dict[str, str]] = None,
 ) -> dict:
     """Returns a dict with industry/career_category/seniority + their
-    *_source fields, only inferring for fields that arrived blank.
+    *_source fields. Imported (nonblank CSV) values always win; only a
+    genuinely blank field is ever derived, and only via the documented
+    deterministic rules above - never fabricated.
     """
     result: dict = {}
 
-    if existing_industry:
-        result["industry"] = existing_industry
-        result["industry_source"] = DataSource.IMPORTED.value
-    else:
-        inferred = infer_industry(company, job_title)
-        result["industry"] = inferred.value
-        result["industry_source"] = inferred.source
+    industry_result = resolve_industry(company, existing_industry, company_industry_map)
+    result["industry"] = industry_result.value
+    result["industry_source"] = industry_result.source
 
-    if existing_career_category:
-        result["career_category"] = existing_career_category
+    if existing_career_category and existing_career_category.strip():
+        result["career_category"] = existing_career_category.strip()
         result["career_category_source"] = DataSource.IMPORTED.value
     else:
-        inferred = infer_career_category(job_title)
-        result["career_category"] = inferred.value
-        result["career_category_source"] = inferred.source
+        career_result = derive_career_category(job_title)
+        result["career_category"] = career_result.value
+        result["career_category_source"] = career_result.source
 
-    if existing_seniority:
-        result["seniority"] = existing_seniority
+    if existing_seniority and existing_seniority.strip():
+        result["seniority"] = existing_seniority.strip()
         result["seniority_source"] = DataSource.IMPORTED.value
     else:
-        inferred = infer_seniority(job_title)
-        result["seniority"] = inferred.value
-        result["seniority_source"] = inferred.source
+        seniority_result = derive_seniority(job_title)
+        result["seniority"] = seniority_result.value
+        result["seniority_source"] = seniority_result.source
 
     return result

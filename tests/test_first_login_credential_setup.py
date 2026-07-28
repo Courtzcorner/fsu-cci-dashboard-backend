@@ -11,7 +11,8 @@ CORS - they only prove the new temporary-credential flow works correctly
 on top of them.
 """
 from app.models.user import User
-from app.seed.temporary_accounts import TEMPORARY_ACCOUNTS, seed_temporary_accounts
+from app.security import hash_password, verify_password
+from app.seed.temporary_accounts import TEMPORARY_ACCOUNTS, repair_seed_usernames, seed_temporary_accounts
 from tests.conftest import ADMIN_PASSWORD, ADMIN_USERNAME
 
 TEMP_PASSWORD = "testtest"
@@ -377,3 +378,142 @@ def test_running_the_seed_does_not_reset_completed_users(client, db_session):
     # The still-pending accounts, however, ARE eligible for a force reset.
     owen = db_session.query(User).filter(User.username == "OwenV").first()
     assert owen.must_change_credentials is True
+
+
+# --------------------------------------------------------------------------
+# --repair-seed-usernames: fixes a pre-existing row the plain seed
+# silently skipped (the reported "Invalid username or password" bug)
+# --------------------------------------------------------------------------
+
+
+def _make_preexisting_broken_row(db_session, username="EllieWebb", role="alumni", password="SomeUnrelatedPass1"):
+    """Simulates a `User` row that existed BEFORE the temporary-account
+    seed feature shipped: an ordinary account, unrelated password,
+    `must_change_credentials` at its column default (False) - exactly
+    the row `seed_temporary_accounts()` cannot safely distinguish from
+    "already completed setup"."""
+    user = User(username=username, password_hash=hash_password(password), role=role)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    return user
+
+
+def test_preexisting_ellie_webb_account_is_repaired(client, db_session):
+    broken = _make_preexisting_broken_row(db_session)
+
+    results = repair_seed_usernames(db_session)
+    outcomes = dict(results)
+    assert outcomes["EllieWebb"] == "repaired"
+
+    db_session.refresh(broken)
+    assert broken.must_change_credentials is True
+    assert verify_password("testtest", broken.password_hash)
+
+
+def test_repair_preserves_the_same_user_id(client, db_session):
+    broken = _make_preexisting_broken_row(db_session)
+    original_id = broken.id
+
+    repair_seed_usernames(db_session)
+
+    db_session.expire_all()
+    repaired = db_session.query(User).filter(User.username == "EllieWebb").first()
+    assert repaired.id == original_id
+
+
+def test_repair_preserves_and_validates_role(client, db_session):
+    _make_preexisting_broken_row(db_session, username="EllieWebb", role="alumni")
+    # A role mismatch (configured as "alumni", but this row is "admin")
+    # must be flagged, never silently overwritten.
+    admin_named_owen = _make_preexisting_broken_row(db_session, username="OwenV", role="admin")
+
+    outcomes = dict(repair_seed_usernames(db_session))
+    assert outcomes["EllieWebb"] == "repaired"
+    assert outcomes["OwenV"] == "role_conflict"
+
+    ellie = db_session.query(User).filter(User.username == "EllieWebb").first()
+    assert ellie.role == "alumni"
+
+    db_session.refresh(admin_named_owen)
+    assert admin_named_owen.role == "admin"
+    assert admin_named_owen.must_change_credentials is False
+
+
+def test_testtest_works_after_repair(client, db_session):
+    _make_preexisting_broken_row(db_session)
+    repair_seed_usernames(db_session)
+
+    response = client.post("/login", json={"username": "EllieWebb", "password": "testtest"})
+    assert response.status_code == 200, response.text
+    assert response.json()["user"]["must_change_credentials"] is True
+
+
+def test_repair_sets_must_change_credentials_true(client, db_session):
+    broken = _make_preexisting_broken_row(db_session)
+    assert broken.must_change_credentials is False  # sanity: starts broken
+
+    repair_seed_usernames(db_session)
+    db_session.refresh(broken)
+    assert broken.must_change_credentials is True
+
+
+def test_repair_does_not_touch_an_account_renamed_after_completed_setup(client, db_session):
+    _seed(db_session)
+    token = _login_temp(client, "EllieWebb").json()["access_token"]
+    client.post(
+        "/auth/complete-first-login",
+        json={"new_username": "ellie.done2", "new_password": STRONG_PASSWORD, "confirm_password": STRONG_PASSWORD},
+        headers=_auth(token),
+    )
+
+    renamed_before = db_session.query(User).filter(User.username == "ellie.done2").first()
+    password_hash_before = renamed_before.password_hash
+
+    outcomes = dict(repair_seed_usernames(db_session))
+    assert outcomes["EllieWebb"] == "completed_and_renamed"
+
+    db_session.refresh(renamed_before)
+    assert renamed_before.username == "ellie.done2"
+    assert renamed_before.password_hash == password_hash_before
+    assert renamed_before.must_change_credentials is False
+
+    # And "EllieWebb" was NOT recreated as a brand-new account.
+    reintroduced = db_session.query(User).filter(User.username == "EllieWebb").first()
+    assert reintroduced is None
+
+
+def test_repair_does_not_touch_unrelated_users(client, admin_user, db_session):
+    admin_password_hash_before = admin_user.password_hash
+    admin_role_before = admin_user.role
+
+    repair_seed_usernames(db_session)
+
+    db_session.refresh(admin_user)
+    assert admin_user.password_hash == admin_password_hash_before
+    assert admin_user.role == admin_role_before
+    assert admin_user.must_change_credentials is False
+
+
+def test_running_the_repair_twice_creates_no_duplicates(client, db_session):
+    _make_preexisting_broken_row(db_session)
+
+    repair_seed_usernames(db_session)
+    repair_seed_usernames(db_session)
+
+    for spec in TEMPORARY_ACCOUNTS:
+        matches = db_session.query(User).filter(User.username == spec.username).all()
+        assert len(matches) <= 1
+
+    ellie_matches = db_session.query(User).filter(User.username == "EllieWebb").all()
+    assert len(ellie_matches) == 1
+
+
+def test_repair_creates_a_wholly_missing_seed_account(client, db_session):
+    outcomes = dict(repair_seed_usernames(db_session))
+    assert outcomes["courtneystokes"] == "created"
+
+    user = db_session.query(User).filter(User.username == "courtneystokes").first()
+    assert user is not None
+    assert user.role == "alumni"
+    assert user.must_change_credentials is True

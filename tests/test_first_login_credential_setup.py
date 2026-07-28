@@ -41,6 +41,26 @@ def test_temporary_username_and_testtest_can_authenticate(client, db_session):
     assert response.status_code == 200, response.text
 
 
+def test_courtneystokes_is_created_as_an_alumni_temporary_account(client, db_session):
+    _seed(db_session)
+
+    user = db_session.query(User).filter(User.username == "courtneystokes").first()
+    assert user is not None
+    assert user.role == "alumni"
+    assert user.must_change_credentials is True
+    assert user.temporary_account_created_at is not None
+    # Password is hashed with the existing bcrypt utility - never stored
+    # in plaintext.
+    assert user.password_hash != "testtest"
+    assert user.password_hash.startswith("$2b$")
+
+    response = _login_temp(client, "courtneystokes")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["user"]["role"] == "alumni"
+    assert body["user"]["must_change_credentials"] is True
+
+
 def test_login_response_has_must_change_credentials_true(client, db_session):
     _seed(db_session)
     response = _login_temp(client, "EllieWebb")

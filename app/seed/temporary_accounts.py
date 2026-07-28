@@ -44,6 +44,7 @@ TEMPORARY_ACCOUNTS: list[TemporaryAccountSpec] = [
     TemporaryAccountSpec(username="Bellabozied", role="alumni"),
     TemporaryAccountSpec(username="OwenV", role="alumni"),
     TemporaryAccountSpec(username="EbeAlum", role="alumni"),
+    TemporaryAccountSpec(username="courtneystokes", role="alumni"),
 ]
 
 

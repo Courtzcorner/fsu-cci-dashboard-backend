@@ -14,6 +14,8 @@ from app.routers.analytics_routes import router as analytics_router
 from app.routers.auth_routes import limiter, router as auth_router
 from app.routers.content_routes import router as content_router
 from app.routers.profile_routes import router as profile_router
+from app.routers.public_profile_routes import router as public_profile_router
+from app.routers.user_profile_routes import router as user_profile_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,7 +60,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -94,6 +96,8 @@ app.include_router(analytics_router)
 app.include_router(admin_router)
 app.include_router(content_router)
 app.include_router(profile_router)
+app.include_router(user_profile_router)
+app.include_router(public_profile_router)
 
 # Serve uploaded profile photos (local storage provider only). Only files
 # saved through app.services.storage_service (server-generated filenames)

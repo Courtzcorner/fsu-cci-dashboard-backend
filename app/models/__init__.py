@@ -6,6 +6,12 @@ from app.models.location_alias import LocationAlias
 from app.models.organization import Organization
 from app.models.reference import Company, Industry, University
 from app.models.user import User
+from app.models.user_profile import (
+    ProfileMatchCandidate,
+    UserEducationHistory,
+    UserProfile,
+    UserWorkHistory,
+)
 
 __all__ = [
     "Alumni",
@@ -18,8 +24,12 @@ __all__ = [
     "LegalNameChangeRequest",
     "LocationAlias",
     "Organization",
+    "ProfileMatchCandidate",
     "Speaker",
     "SuperStar",
     "University",
     "User",
+    "UserEducationHistory",
+    "UserProfile",
+    "UserWorkHistory",
 ]

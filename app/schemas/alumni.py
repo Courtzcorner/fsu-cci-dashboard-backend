@@ -35,6 +35,14 @@ class AlumniOut(BaseModel):
     verification_date: Optional[date] = None
     profile_completion: int
 
+    # --- Additive: alumni account profile linking (see
+    # app.routers.user_profile_routes / app.routers.public_profile_routes).
+    # These never affect filtering, pagination, or counting above - they
+    # only describe whether a confirmed self-service profile exists. ---
+    has_public_profile: bool = False
+    public_profile_url: Optional[str] = None
+    profile_photo_url: Optional[str] = None
+
 
 class AlumniListMeta(BaseModel):
     organization: str

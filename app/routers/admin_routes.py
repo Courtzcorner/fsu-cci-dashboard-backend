@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -16,11 +17,15 @@ from app.models.alumni import Alumni, AlumniOrganization
 from app.models.audit import CSVImport
 from app.models.legal_name import LegalNameChangeRequest
 from app.models.organization import Organization
+from app.models.user import User
+from app.models.user_profile import LinkStatus, ProfileMatchCandidate, UserProfile
 from app.schemas.admin import CurrentImportOut, ImportResult, NormalizeLocationsResult, RowError
 from app.schemas.profile import LegalNameChangeRequestOut
+from app.schemas.user_profile import AdminProfileLinkActionOut, AdminProfileMatchCandidateOut, MatchCandidateOut
 from app.services.audit_service import record_audit_log
 from app.services.csv_import_service import IMPORT_LOGIC_VERSION, import_alumni_csv
 from app.services.location_reprocess_service import reprocess_locations
+from app.services.profile_link_service import admin_approve, admin_reject, sync_link_review_status
 
 EXPORT_COLUMNS = [
     "First Name", "Last Name", "Email", "LinkedIn URL", "Company Name", "Job Title",
@@ -402,3 +407,160 @@ def reject_legal_name_request(
     db.commit()
     db.refresh(request)
     return request
+
+
+# --------------------------------------------------------------------------
+# Alumni profile <-> directory link review (additive; never touches the
+# CSV import pipeline, Alumni records, or existing analytics).
+# --------------------------------------------------------------------------
+
+
+def _profile_needs_admin_attention(db: Session, profile: UserProfile) -> bool:
+    sync_link_review_status(db, profile)
+    return profile.link_status in (LinkStatus.CANDIDATE, LinkStatus.CONFLICT) or profile.needs_review
+
+
+@router.get("/profile-match-candidates", response_model=list[AdminProfileMatchCandidateOut])
+def list_profile_match_candidates(
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[AdminProfileMatchCandidateOut]:
+    """Every user profile that needs admin attention: multiple qualifying
+    candidates, a rejected-by-conflict link, or a confirmed link whose
+    alumni record was deactivated by a newer CSV import."""
+    require_admin_role(current_user)
+
+    profiles = (
+        db.query(UserProfile)
+        .filter(UserProfile.link_status.in_([LinkStatus.CANDIDATE, LinkStatus.CONFLICT]))
+        .all()
+    )
+    # Also surface confirmed links flagged needs_review by a later import.
+    confirmed_profiles = (
+        db.query(UserProfile)
+        .filter(UserProfile.link_status.in_(LinkStatus.CONFIRMED))
+        .all()
+    )
+    for profile in confirmed_profiles:
+        sync_link_review_status(db, profile)
+    review_flagged = [p for p in confirmed_profiles if p.needs_review]
+
+    results: list[AdminProfileMatchCandidateOut] = []
+    for profile in [*profiles, *review_flagged]:
+        user = db.get(User, profile.user_id)
+        candidate_rows = (
+            db.query(ProfileMatchCandidate)
+            .filter(ProfileMatchCandidate.user_profile_id == profile.id, ProfileMatchCandidate.status == "candidate")
+            .order_by(ProfileMatchCandidate.score.desc())
+            .all()
+        )
+        candidates = []
+        for row in candidate_rows:
+            alumni = db.get(Alumni, row.alumni_id)
+            if alumni is None:
+                continue
+            candidates.append(
+                MatchCandidateOut(
+                    alumni_id=alumni.id,
+                    full_name=alumni.full_name,
+                    university=alumni.university,
+                    company=alumni.company,
+                    job_title=alumni.job_title,
+                    city=alumni.city,
+                    state=alumni.state,
+                    match_type=row.match_type,
+                    score=row.score,
+                    matched_signals=json.loads(row.matched_signals),
+                )
+            )
+        full_name = None
+        if profile.first_name or profile.last_name:
+            full_name = f"{profile.first_name or ''} {profile.last_name or ''}".strip()
+        results.append(
+            AdminProfileMatchCandidateOut(
+                user_profile_id=profile.id,
+                user_id=profile.user_id,
+                username=user.username if user else "",
+                profile_full_name=full_name,
+                link_status=profile.link_status,
+                needs_review=profile.needs_review,
+                candidates=candidates,
+            )
+        )
+    return results
+
+
+def _get_profile_or_404(db: Session, profile_id: str) -> UserProfile:
+    profile = db.get(UserProfile, profile_id)
+    if profile is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User profile not found")
+    return profile
+
+
+def _to_admin_link_action_out(profile: UserProfile) -> AdminProfileLinkActionOut:
+    return AdminProfileLinkActionOut(
+        user_profile_id=profile.id,
+        alumni_id=profile.alumni_id,
+        link_status=profile.link_status,
+        linked_at=profile.linked_at,
+        linked_by=profile.linked_by,
+        needs_review=profile.needs_review,
+    )
+
+
+@router.post("/profile-links/{profile_id}/approve", response_model=AdminProfileLinkActionOut)
+def approve_profile_link(
+    profile_id: str,
+    alumni_id: str = Form(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AdminProfileLinkActionOut:
+    """Admin confirms `profile_id` is linked to `alumni_id`. If another
+    account was previously confirmed against the same alumni record, it
+    is demoted to `conflict` (never silently left double-confirmed)."""
+    require_admin_role(current_user)
+    profile = _get_profile_or_404(db, profile_id)
+    alumni = db.get(Alumni, alumni_id)
+    if alumni is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alumni record not found")
+    record_audit_log(
+        db, user_id=current_user.id, action="approve", entity_type="profile_link",
+        entity_id=profile.id, details={"alumni_id": alumni_id},
+    )
+    profile = admin_approve(db, profile, alumni_id, current_user.id)
+    return _to_admin_link_action_out(profile)
+
+
+@router.post("/profile-links/{profile_id}/reject", response_model=AdminProfileLinkActionOut)
+def reject_profile_link(
+    profile_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AdminProfileLinkActionOut:
+    require_admin_role(current_user)
+    profile = _get_profile_or_404(db, profile_id)
+    record_audit_log(
+        db, user_id=current_user.id, action="reject", entity_type="profile_link", entity_id=profile.id,
+    )
+    profile = admin_reject(db, profile)
+    return _to_admin_link_action_out(profile)
+
+
+@router.delete("/profile-links/{profile_id}", response_model=AdminProfileLinkActionOut)
+def unlink_profile_link(
+    profile_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AdminProfileLinkActionOut:
+    """Admin-initiated unlink. Neither the UserProfile row nor the Alumni
+    record is deleted - only the link between them is cleared."""
+    require_admin_role(current_user)
+    profile = _get_profile_or_404(db, profile_id)
+    record_audit_log(
+        db, user_id=current_user.id, action="unlink", entity_type="profile_link", entity_id=profile.id,
+    )
+    from app.services.profile_link_service import unlink as unlink_profile
+
+    unlink_profile(db, profile)
+    db.refresh(profile)
+    return _to_admin_link_action_out(profile)

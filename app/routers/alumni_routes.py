@@ -8,6 +8,7 @@ from app.database import get_db
 from app.deps import CurrentUser, get_current_user, get_organization_by_slug_for_current_user
 from app.models.alumni import Alumni, AlumniOrganization
 from app.models.organization import Organization
+from app.models.user_profile import LinkStatus, UserProfile
 from app.schemas.alumni import AlumniListMeta, AlumniListResponse, AlumniOut
 
 router = APIRouter(tags=["alumni"])
@@ -90,6 +91,19 @@ def get_alumni_data(
         .all()
     )
 
+    # Additive: one query for every confirmed profile among this page's
+    # alumni ids, rather than a per-row lookup (no N+1 pattern), so
+    # directory pagination performance is unaffected at 75,000+ rows.
+    record_ids = [record.id for record in records]
+    linked_profiles: dict[str, UserProfile] = {}
+    if record_ids:
+        confirmed_profiles = (
+            db.query(UserProfile)
+            .filter(UserProfile.alumni_id.in_(record_ids), UserProfile.link_status.in_(LinkStatus.CONFIRMED))
+            .all()
+        )
+        linked_profiles = {profile.alumni_id: profile for profile in confirmed_profiles}
+
     data = [
         AlumniOut(
             id=record.id,
@@ -121,6 +135,11 @@ def get_alumni_data(
             verification_status=record.verification_status,
             verification_date=record.verification_date,
             profile_completion=record.profile_completion,
+            has_public_profile=record.id in linked_profiles,
+            public_profile_url=f"/alumni/{record.id}" if record.id in linked_profiles else None,
+            profile_photo_url=(
+                linked_profiles[record.id].profile_photo_url if record.id in linked_profiles else None
+            ),
         )
         for record in records
     ]

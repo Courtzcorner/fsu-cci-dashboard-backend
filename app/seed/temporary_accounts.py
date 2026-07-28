@@ -16,6 +16,13 @@ Idempotent provisioning for the small set of seeded temporary accounts
 Never invoked automatically at application startup (see
 scripts/seed_temporary_accounts.py for the one-time Render Shell
 command) - only ever run deliberately, on demand.
+
+See `recreate_dashboard_test_accounts` at the bottom of this module for a
+separate, more aggressive "delete every old temporary test login and
+recreate the current six from scratch" command - it deliberately does
+NOT try to preserve/repair any pre-existing row (unlike
+`repair_seed_usernames` above), since its entire purpose is a clean
+reset of the testing group.
 """
 from dataclasses import dataclass
 from typing import Literal
@@ -35,11 +42,21 @@ RepairOutcome = Literal[
     "created", "repaired", "already_pending", "completed_and_renamed", "role_conflict", "not_found"
 ]
 DeleteOutcome = Literal["deleted", "not_found", "skipped_renamed"]
+OldAccountOutcome = Literal["deleted_old", "not_found_old", "skipped_renamed"]
+NewAccountOutcome = Literal["created_new", "failed"]
 
 # The five ORIGINAL broken temporary seed usernames - deliberately does
 # NOT include "courtneystokes" (added later, never reported broken) or
 # any other account.
 BROKEN_SEED_USERNAMES: tuple[str, ...] = ("Eberanderee", "EllieWebb", "Bellabozied", "OwenV", "EbeAlum")
+
+# Every username the dashboard testing group has EVER used, across every
+# generation of this seed (including "courtneystokes", replaced below by
+# "courtney1", and "courtney1" itself so that re-running the recreate
+# command is idempotent - see `recreate_dashboard_test_accounts`).
+OLD_DASHBOARD_TEST_USERNAMES: tuple[str, ...] = (
+    "Eberanderee", "EllieWebb", "Bellabozied", "OwenV", "EbeAlum", "courtneystokes", "courtney1",
+)
 
 
 @dataclass(frozen=True)
@@ -63,6 +80,19 @@ TEMPORARY_ACCOUNTS: list[TemporaryAccountSpec] = [
 # six exact names, case insensitively" - never any other user in the
 # `users` table.
 REPAIR_SEED_USERNAMES: tuple[str, ...] = tuple(spec.username for spec in TEMPORARY_ACCOUNTS)
+
+# The CURRENT six dashboard testing accounts - source of truth for
+# `recreate_dashboard_test_accounts`. "courtney1" replaces the retired
+# "courtneystokes" username. Roles here are authoritative and are never
+# inferred from any deleted row.
+DASHBOARD_TEST_ACCOUNTS: list[TemporaryAccountSpec] = [
+    TemporaryAccountSpec(username="Eberanderee", role="admin"),
+    TemporaryAccountSpec(username="EllieWebb", role="alumni"),
+    TemporaryAccountSpec(username="Bellabozied", role="alumni"),
+    TemporaryAccountSpec(username="OwenV", role="alumni"),
+    TemporaryAccountSpec(username="EbeAlum", role="alumni"),
+    TemporaryAccountSpec(username="courtney1", role="alumni"),
+]
 
 
 def seed_temporary_accounts(db: Session, force_reset: bool = False) -> list[tuple[str, SeedOutcome]]:
@@ -316,3 +346,163 @@ def delete_broken_seed_users(db: Session) -> list[tuple[str, DeleteOutcome]]:
 
     db.commit()
     return results
+
+
+def _create_dashboard_test_account(db: Session, spec: TemporaryAccountSpec) -> User:
+    """The exact same account-creation logic and password-hashing utility
+    used by `seed_temporary_accounts()` above (the same one that created
+    the original "courtneystokes" account) - a brand-new row, a fresh
+    generated id (never reused from a deleted row), `testtest` hashed
+    with the existing bcrypt utility (never stored in plaintext), and
+    every credential-state column reset to its true "never logged in
+    yet" starting value."""
+    user = User(
+        username=spec.username,
+        password_hash=hash_password(TEMPORARY_PASSWORD),
+        role=spec.role,
+        must_change_credentials=True,
+        temporary_account_created_at=utcnow(),
+        credentials_updated_at=None,
+        previous_username=None,
+        username_changed_at=None,
+        token_version=0,
+    )
+    db.add(user)
+    db.flush()
+    record_audit_log(
+        db,
+        user_id=None,
+        action="temporary_account_created",
+        entity_type="user",
+        entity_id=user.id,
+        details={"username": spec.username, "role": spec.role},
+    )
+    return user
+
+
+@dataclass
+class RecreateDashboardTestAccountsResult:
+    deleted: list[tuple[str, OldAccountOutcome]]
+    created: list[tuple[str, NewAccountOutcome]]
+    failed: list[tuple[str, str]]
+    committed: bool
+
+
+def recreate_dashboard_test_accounts(db: Session) -> RecreateDashboardTestAccountsResult:
+    """Fully deletes every OLD dashboard temporary test login
+    (OLD_DASHBOARD_TEST_USERNAMES) and recreates the CURRENT six
+    (DASHBOARD_TEST_ACCOUNTS) from scratch, atomically.
+
+    Deliberately more aggressive than `seed_temporary_accounts` /
+    `repair_seed_usernames` above - it does not try to detect or
+    preserve a pre-existing row; its entire purpose is a clean, one-time
+    reset of this specific, hard-coded testing group. Callers (see
+    scripts/recreate_dashboard_test_accounts.py) are expected to gate
+    this behind an explicit CLI confirmation flag, since - unlike the
+    marker-gated `delete_broken_seed_users` above - this function WILL
+    delete a row matching one of these seven exact usernames even if it
+    was never created by this seed system.
+
+      - IDENTIFICATION (exact-match only): a `User` row is a candidate
+        for deletion if, and ONLY if, its CURRENT username (case
+        insensitive) exactly matches one of the seven names in
+        OLD_DASHBOARD_TEST_USERNAMES. The `temporary_account_created_at`
+        marker is deliberately NOT required - this command is explicitly
+        authorized to replace a legacy/broken row under one of these
+        exact names regardless of how it originally got there. A row is
+        NEVER matched by `previous_username` alone, and NEVER matched by
+        a "similar" (fuzzy) name - only an exact, case-insensitive match
+        on one of these seven literal strings.
+      - An account that already completed first-login setup and renamed
+        itself away from one of these names is left completely
+        untouched (reported "skipped_renamed") - not deleted, and its
+        replacement is still freshly created under the original
+        temporary username so testers keep a working login.
+      - Dependent UserProfile (and its UserWorkHistory /
+        UserEducationHistory / ProfileMatchCandidate children) are
+        deleted first, ONLY for a row actually being deleted, and ONLY
+        because the `users` table foreign key requires it.
+      - Never touches `alumni` (imported CSV directory data),
+        `csv_imports`, `companies`, universities, analytics data, or any
+        other user's own profile/relationships.
+      - RECREATION uses the exact same helper as the normal seed
+        (`_create_dashboard_test_account`, sharing
+        `hash_password`/`TEMPORARY_PASSWORD`) - a brand-new id, a newly
+        generated password hash for `testtest` (never reused from a
+        deleted row), `must_change_credentials=True`,
+        `temporary_account_created_at=now`, and
+        `credentials_updated_at` / `previous_username` /
+        `username_changed_at` all reset to None.
+      - ATOMIC: everything (every deletion AND every creation) happens
+        in one transaction. If any of the six new accounts cannot be
+        created, the entire transaction - deletions included - is
+        rolled back, and NONE of the six new accounts are left partially
+        created.
+    """
+    deleted: list[tuple[str, OldAccountOutcome]] = []
+    to_delete: list[User] = []
+
+    for username in OLD_DASHBOARD_TEST_USERNAMES:
+        user = db.query(User).filter(func.lower(User.username) == username.lower()).first()
+
+        if user is None:
+            renamed = db.query(User).filter(func.lower(User.previous_username) == username.lower()).first()
+            deleted.append((username, "skipped_renamed" if renamed is not None else "not_found_old"))
+            continue
+
+        to_delete.append(user)
+
+    try:
+        for user in to_delete:
+            profile = db.query(UserProfile).filter(UserProfile.user_id == user.id).first()
+            if profile is not None:
+                db.query(ProfileMatchCandidate).filter(ProfileMatchCandidate.user_profile_id == profile.id).delete(
+                    synchronize_session=False
+                )
+                db.query(UserWorkHistory).filter(UserWorkHistory.user_profile_id == profile.id).delete(
+                    synchronize_session=False
+                )
+                db.query(UserEducationHistory).filter(UserEducationHistory.user_profile_id == profile.id).delete(
+                    synchronize_session=False
+                )
+                db.delete(profile)
+
+            record_audit_log(
+                db,
+                user_id=None,
+                action="temporary_account_deleted",
+                entity_type="user",
+                entity_id=user.id,
+                details={"username": user.username, "role": user.role},
+            )
+            print(f"Deleted old temporary account: {user.username}")
+            deleted.append((user.username, "deleted_old"))
+            db.delete(user)
+        db.flush()
+
+        created: list[tuple[str, NewAccountOutcome]] = []
+        for spec in DASHBOARD_TEST_ACCOUNTS:
+            conflict = db.query(User).filter(func.lower(User.username) == spec.username.lower()).first()
+            if conflict is not None:
+                raise RuntimeError(
+                    f"Cannot create temporary account '{spec.username}': a User row with that "
+                    f"username still exists (id={conflict.id})."
+                )
+            _create_dashboard_test_account(db, spec)
+            db.flush()
+            print(f"Created temporary account: {spec.username}")
+            print(f"Role: {spec.role}")
+            print("Credential setup required: true")
+            created.append((spec.username, "created_new"))
+
+    except Exception as exc:
+        # Atomic: on ANY failure, the entire transaction - every deletion
+        # AND every creation attempted so far - is rolled back, so the
+        # database ends up completely unchanged rather than a partial
+        # set of the six accounts.
+        db.rollback()
+        failed = [(spec.username, str(exc)) for spec in DASHBOARD_TEST_ACCOUNTS]
+        return RecreateDashboardTestAccountsResult(deleted=[], created=[], failed=failed, committed=False)
+
+    db.commit()
+    return RecreateDashboardTestAccountsResult(deleted=deleted, created=created, failed=[], committed=True)

@@ -72,6 +72,12 @@ TEMPORARY_ACCOUNTS: list[TemporaryAccountSpec] = [
     TemporaryAccountSpec(username="OwenV", role="alumni"),
     TemporaryAccountSpec(username="EbeAlum", role="alumni"),
     TemporaryAccountSpec(username="courtneystokes", role="alumni"),
+    # --- Additive second batch - same seed/idempotency rules apply ---
+    TemporaryAccountSpec(username="Bellab", role="alumni"),
+    TemporaryAccountSpec(username="Owebva", role="alumni"),
+    TemporaryAccountSpec(username="Ellliew", role="alumni"),
+    TemporaryAccountSpec(username="JuliaS", role="alumni"),
+    TemporaryAccountSpec(username="CourtneyS", role="admin"),
 ]
 
 # The exact six seed usernames the --repair-seed-usernames CLI flag is

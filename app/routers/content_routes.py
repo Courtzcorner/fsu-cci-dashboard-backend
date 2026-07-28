@@ -26,6 +26,11 @@ from app.schemas.content import (
     SuperStarUpdate,
 )
 from app.services.audit_service import record_audit_log
+from app.services.content_version_service import (
+    bump_for_event_change,
+    bump_for_speaker_change,
+    bump_for_superstar_change,
+)
 
 router = APIRouter(tags=["content"])
 
@@ -75,6 +80,7 @@ def create_event(
         db, user_id=current_user.id, action="create", entity_type="event", entity_id=event.id,
         organization_id=organization.id,
     )
+    bump_for_event_change(db, change_type="event_create", updated_by_user_id=current_user.id, resource_id=event.id)
     db.commit()
     return event
 
@@ -95,6 +101,7 @@ def update_event(
         db, user_id=current_user.id, action="update", entity_type="event", entity_id=event.id,
         organization_id=organization.id,
     )
+    bump_for_event_change(db, change_type="event_update", updated_by_user_id=current_user.id, resource_id=event.id)
     db.commit()
     return event
 
@@ -112,6 +119,8 @@ def delete_event(
         db, user_id=current_user.id, action="delete", entity_type="event", entity_id=event.id,
         organization_id=organization.id,
     )
+    deleted_event_id = event.id
+    bump_for_event_change(db, change_type="event_delete", updated_by_user_id=current_user.id, resource_id=deleted_event_id)
     db.delete(event)
     db.commit()
 
@@ -150,6 +159,9 @@ def create_speaker(
         db, user_id=current_user.id, action="create", entity_type="speaker", entity_id=speaker.id,
         organization_id=organization.id,
     )
+    bump_for_speaker_change(
+        db, change_type="speaker_create", updated_by_user_id=current_user.id, resource_id=speaker.id
+    )
     db.commit()
     return speaker
 
@@ -170,6 +182,9 @@ def update_speaker(
         db, user_id=current_user.id, action="update", entity_type="speaker", entity_id=speaker.id,
         organization_id=organization.id,
     )
+    bump_for_speaker_change(
+        db, change_type="speaker_update", updated_by_user_id=current_user.id, resource_id=speaker.id
+    )
     db.commit()
     return speaker
 
@@ -186,6 +201,10 @@ def delete_speaker(
     record_audit_log(
         db, user_id=current_user.id, action="delete", entity_type="speaker", entity_id=speaker.id,
         organization_id=organization.id,
+    )
+    deleted_speaker_id = speaker.id
+    bump_for_speaker_change(
+        db, change_type="speaker_delete", updated_by_user_id=current_user.id, resource_id=deleted_speaker_id
     )
     db.delete(speaker)
     db.commit()
@@ -232,6 +251,9 @@ def create_super_star(
         db, user_id=current_user.id, action="create", entity_type="super_star", entity_id=super_star.id,
         organization_id=organization.id,
     )
+    bump_for_superstar_change(
+        db, change_type="superstar_create", updated_by_user_id=current_user.id, resource_id=super_star.id
+    )
     db.commit()
     return super_star
 
@@ -252,6 +274,12 @@ def update_super_star(
         db, user_id=current_user.id, action="update", entity_type="super_star", entity_id=super_star.id,
         organization_id=organization.id,
     )
+    # Covers every mutation to an existing Super STAR - including
+    # feature/unfeature, which is just an `is_published`/`featured_at`
+    # change through this same endpoint.
+    bump_for_superstar_change(
+        db, change_type="superstar_update", updated_by_user_id=current_user.id, resource_id=super_star.id
+    )
     db.commit()
     return super_star
 
@@ -268,6 +296,10 @@ def delete_super_star(
     record_audit_log(
         db, user_id=current_user.id, action="delete", entity_type="super_star", entity_id=super_star.id,
         organization_id=organization.id,
+    )
+    deleted_super_star_id = super_star.id
+    bump_for_superstar_change(
+        db, change_type="superstar_delete", updated_by_user_id=current_user.id, resource_id=deleted_super_star_id
     )
     db.delete(super_star)
     db.commit()

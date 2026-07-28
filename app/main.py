@@ -15,6 +15,7 @@ from app.routers.auth_routes import limiter, router as auth_router
 from app.routers.content_routes import router as content_router
 from app.routers.profile_routes import router as profile_router
 from app.routers.public_profile_routes import router as public_profile_router
+from app.routers.sync_routes import router as sync_router
 from app.routers.user_profile_routes import router as user_profile_router
 
 logging.basicConfig(
@@ -65,12 +66,25 @@ app.add_middleware(
 )
 
 
+# Static assets (uploaded profile photos) and the API docs pages are the
+# only responses allowed to be cached by an intermediary - everything
+# else is authenticated, dynamic, shared-data content that must never be
+# served stale from a cache.
+_CACHEABLE_PATH_PREFIXES = ("/uploads",)
+_CACHEABLE_EXACT_PATHS = {"/docs", "/redoc", "/openapi.json", "/health"}
+
+
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
+
+    path = request.url.path
+    is_cacheable = path in _CACHEABLE_EXACT_PATHS or any(path.startswith(p) for p in _CACHEABLE_PATH_PREFIXES)
+    if not is_cacheable:
+        response.headers.setdefault("Cache-Control", "no-store")
     return response
 
 
@@ -98,6 +112,7 @@ app.include_router(content_router)
 app.include_router(profile_router)
 app.include_router(user_profile_router)
 app.include_router(public_profile_router)
+app.include_router(sync_router)
 
 # Serve uploaded profile photos (local storage provider only). Only files
 # saved through app.services.storage_service (server-generated filenames)

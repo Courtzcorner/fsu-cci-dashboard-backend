@@ -1,6 +1,7 @@
 from app.models.alumni import Alumni, AlumniOrganization
 from app.models.audit import AuditLog, CSVImport
 from app.models.content import Event, Speaker, SuperStar
+from app.models.content_version import ContentVersion
 from app.models.legal_name import LegalNameChangeRequest
 from app.models.location_alias import LocationAlias
 from app.models.organization import Organization
@@ -19,6 +20,7 @@ __all__ = [
     "AuditLog",
     "CSVImport",
     "Company",
+    "ContentVersion",
     "Event",
     "Industry",
     "LegalNameChangeRequest",

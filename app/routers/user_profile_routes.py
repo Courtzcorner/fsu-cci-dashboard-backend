@@ -38,6 +38,7 @@ from app.schemas.user_profile import (
     WorkHistoryIn,
     WorkHistoryOut,
 )
+from app.services.content_version_service import EFFECTIVE_TRACKED_PROFILE_FIELDS, bump_for_profile_update
 from app.services.effective_profile_service import recompute_profile_effective_fields
 from app.services.identity_matching_service import matched_field_names, nonmatching_field_names
 from app.services.profile_link_service import (
@@ -177,9 +178,13 @@ def update_my_profile(
     alumni record is never a prerequisite for filling out or editing a
     profile."""
     profile = _get_or_create_profile(db, current_user)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    updates = payload.model_dump(exclude_unset=True)
+    before = {field: getattr(profile, field, None) for field in EFFECTIVE_TRACKED_PROFILE_FIELDS if field in updates}
+    for field, value in updates.items():
         setattr(profile, field, value)
     recompute_profile_effective_fields(db, profile)
+    changed_fields = {field for field, old_value in before.items() if getattr(profile, field, None) != old_value}
+    bump_for_profile_update(db, profile, changed_fields, updated_by_user_id=current_user.id, resource_id=profile.id)
     db.commit()
     db.refresh(profile)
     return _to_envelope(profile)

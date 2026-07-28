@@ -34,6 +34,7 @@ from app.models.organization import Organization
 from app.models.reference import Company, Industry, University
 from app.services.audit_service import record_audit_log
 from app.services.classification_service import build_company_industry_map, classify_alumni_fields
+from app.services.content_version_service import bump_for_csv_import
 from app.services.location_normalization_service import normalize_city_state, normalize_location
 
 logger = logging.getLogger(__name__)
@@ -1145,11 +1146,20 @@ def import_alumni_csv(
             },
         )
 
+        # Shared content-sync versions: bumped as part of THIS SAME
+        # transaction (not yet committed) so a rollback below undoes the
+        # bump exactly like every other row change. Every logged-in
+        # client - regardless of when its session started - can now
+        # detect this import via GET /sync/status without polling
+        # analytics or alumni data directly.
+        bump_for_csv_import(db, updated_by_user_id=imported_by_user_id, resource_id=csv_import_record.id)
+
         # The whole import (every row change + archiving + the
-        # CSVImport/AuditLog rows) is committed as a single transaction. If
-        # the commit itself fails for any reason, the transaction is rolled
-        # back so we never report success for a partially-applied import,
-        # and the previous active dataset remains untouched.
+        # CSVImport/AuditLog rows + content-version bumps) is committed as
+        # a single transaction. If the commit itself fails for any reason,
+        # the transaction is rolled back so we never report success for a
+        # partially-applied import, and the previous active dataset
+        # remains untouched.
         db.commit()
     except Exception:
         db.rollback()

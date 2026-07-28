@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.models.alumni import Alumni
 from app.models.user_profile import LinkStatus, ProfileMatchCandidate, UserProfile
+from app.services.content_version_service import bump_domains, bump_for_profile_link_change
 from app.services.effective_profile_service import recompute_profile_effective_fields
 from app.services.identity_matching_service import compute_match_candidates
 
@@ -149,6 +150,9 @@ def confirm_match(db: Session, profile: UserProfile, alumni_id: str) -> UserProf
     # even if this profile was never saved via PUT /profile/me before
     # being confirmed.
     recompute_profile_effective_fields(db, profile)
+    bump_for_profile_link_change(
+        db, change_type="profile_link_user_confirmed", updated_by_user_id=profile.user_id, resource_id=profile.id
+    )
     db.commit()
     db.refresh(profile)
     return profile
@@ -193,6 +197,7 @@ def reject_match(db: Session, profile: UserProfile, alumni_id: str) -> None:
 def unlink(db: Session, profile: UserProfile) -> None:
     """Clears the link on the UserProfile ONLY. The Alumni record and its
     imported data are never touched."""
+    was_confirmed = profile.link_status in LinkStatus.CONFIRMED
     profile.alumni_id = None
     profile.link_status = LinkStatus.UNMATCHED
     profile.link_confidence = None
@@ -200,6 +205,14 @@ def unlink(db: Session, profile: UserProfile) -> None:
     profile.linked_by = None
     profile.match_evidence = None
     profile.needs_review = False
+    if was_confirmed:
+        # Only a previously-CONFIRMED link's removal actually changes what
+        # the public directory/analytics show (it reverts to the raw
+        # imported Alumni values) - unlinking a candidate/rejected/unmatched
+        # profile has no such effect.
+        bump_for_profile_link_change(
+            db, change_type="profile_link_unlinked", updated_by_user_id=profile.user_id, resource_id=profile.id
+        )
     db.commit()
 
 
@@ -255,18 +268,34 @@ def admin_approve(db: Session, profile: UserProfile, alumni_id: str, admin_user_
         candidate_row.status = "confirmed"
 
     recompute_profile_effective_fields(db, profile)
+    bump_for_profile_link_change(
+        db, change_type="profile_link_admin_approved", updated_by_user_id=admin_user_id, resource_id=profile.id
+    )
     db.commit()
     db.refresh(profile)
     return profile
 
 
 def admin_reject(db: Session, profile: UserProfile) -> UserProfile:
+    was_confirmed = profile.link_status in LinkStatus.CONFIRMED
     profile.alumni_id = None
     profile.link_status = LinkStatus.REJECTED
     profile.link_confidence = None
     profile.linked_at = None
     profile.linked_by = None
     profile.needs_review = False
+    if was_confirmed:
+        bump_for_profile_link_change(
+            db, change_type="profile_link_admin_rejected", updated_by_user_id=None, resource_id=profile.id
+        )
+    else:
+        # Always still moves the profile out of the admin moderation
+        # queue, even if it was never confirmed (e.g. rejecting a
+        # "candidate"/"conflict" row) - never touches alumni/analytics/
+        # locations, since nothing was ever being publicly displayed yet.
+        bump_domains(
+            db, ["profiles"], updated_by_user_id=None, change_type="profile_link_admin_rejected", resource_id=profile.id
+        )
     db.commit()
     db.refresh(profile)
     return profile

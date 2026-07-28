@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.models.alumni import Alumni
 from app.models.user_profile import LinkStatus, ProfileMatchCandidate, UserProfile
+from app.services.effective_profile_service import recompute_profile_effective_fields
 from app.services.identity_matching_service import compute_match_candidates
 
 
@@ -144,6 +145,10 @@ def confirm_match(db: Session, profile: UserProfile, alumni_id: str) -> UserProf
     profile.match_evidence = candidate_row.matched_signals
     profile.needs_review = False
     candidate_row.status = "confirmed"
+    # Defensive/idempotent: ensures the effective-data cache is fresh
+    # even if this profile was never saved via PUT /profile/me before
+    # being confirmed.
+    recompute_profile_effective_fields(db, profile)
     db.commit()
     db.refresh(profile)
     return profile
@@ -249,6 +254,7 @@ def admin_approve(db: Session, profile: UserProfile, alumni_id: str, admin_user_
         profile.match_evidence = candidate_row.matched_signals
         candidate_row.status = "confirmed"
 
+    recompute_profile_effective_fields(db, profile)
     db.commit()
     db.refresh(profile)
     return profile

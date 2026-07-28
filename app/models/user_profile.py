@@ -63,7 +63,18 @@ class UserProfile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     current_job_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     current_employer: Mapped[str | None] = mapped_column(String(255), nullable=True)
     current_university: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Quick, top-level education summary fields - independent of (and
+    # simpler than) the multi-entry `education_history` below. Never
+    # required, since the imported CSV may only ever provide a single
+    # free-text "Education" value.
+    degree: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    field_of_study: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    graduation_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     bio: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # User-supplied industry (only deterministic source #1 for
+    # `effective_industry` below - never guessed from `current_employer`).
+    current_industry: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # --- Contact & email preferences (private by default) ---
     primary_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -122,6 +133,21 @@ class UserProfile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # every automatic or user-confirmed link, never fabricated after
     # the fact.
     match_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # --- Effective-data cache (see app.services.effective_profile_service) ---
+    # Recomputed every time the underlying profile fields change (never
+    # per analytics query - this is what keeps the SQL effective-data
+    # layer in app.services.effective_alumni_service a plain CASE/COALESCE
+    # join instead of a per-row Python computation). Only ever consulted
+    # for a CONFIRMED link, and only for fields the owner has not marked
+    # private.
+    effective_full_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    effective_seniority: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    effective_seniority_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    effective_career_category: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    effective_career_category_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    effective_industry: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    effective_industry_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
     # Set (lazily, on read - see identity_matching_service.sync_link_review_status)
     # when a previously confirmed link's Alumni record has been
     # deactivated by a newer CSV replace-mode import. Never auto-resolved;

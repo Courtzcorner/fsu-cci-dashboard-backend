@@ -56,6 +56,25 @@ def get_public_profile(
 
     profile = sync_link_review_status(db, profile)
 
+    # --- Effective display values: a confirmed profile's own field wins
+    # over the imported Alumni value, but ONLY when it is nonblank AND
+    # the owner has not marked that field private. The imported Alumni
+    # row itself is never modified - these are just this response's
+    # displayed values (see app.services.effective_alumni_service for
+    # the equivalent SQL-level logic used by directory/analytics). ---
+    if profile.effective_full_name:
+        out.full_name = profile.effective_full_name
+    if profile.show_current_employer and profile.current_employer:
+        out.company = profile.current_employer
+    if profile.show_job_title and profile.current_job_title:
+        out.job_title = profile.current_job_title
+    if profile.show_education and profile.current_university:
+        out.university = profile.current_university
+    if profile.show_location and profile.current_city:
+        out.city = profile.current_city
+    if profile.show_location and profile.current_state:
+        out.state = profile.current_state
+
     out.profile_photo_url = profile.profile_photo_url
     out.preferred_name = profile.preferred_name
     out.headline = profile.headline
@@ -76,15 +95,7 @@ def get_public_profile(
         out.phone_number = profile.phone_number
     if profile.show_birthday:
         out.birthday = profile.birthday
-    if profile.show_location:
-        # current_city/current_state are additive to the already-public
-        # imported city/state - no imported field is hidden either way.
-        pass
-    if profile.show_current_employer:
-        pass  # alumni.company (imported) is already public in the directory
-    if profile.show_job_title:
-        pass  # alumni.job_title (imported) is already public in the directory
-    if profile.show_linkedin:
+    if profile.show_linkedin and profile.linkedin_url:
         out.linkedin_url = profile.linkedin_url
     if profile.show_social_links:
         out.github_url = profile.github_url

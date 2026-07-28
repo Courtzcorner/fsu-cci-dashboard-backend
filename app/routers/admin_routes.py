@@ -32,6 +32,15 @@ EXPORT_COLUMNS = [
     "City", "State", "Education", "Verification Status", "Verification Date",
     "Industry", "Industry Source", "Career Category", "Career Category Source",
     "Seniority", "Seniority Source",
+    # Effective-data layer: original imported value, user-supplied
+    # profile override (only when a CONFIRMED link exists), and the
+    # resulting effective (displayed) value - never destroying the
+    # imported source columns above.
+    "Imported Company", "Profile Company", "Effective Company",
+    "Imported Job Title", "Profile Job Title", "Effective Job Title",
+    "Imported University", "Profile University", "Effective University",
+    "Imported City", "Profile City", "Effective City",
+    "Profile Link Status", "Profile Updated At",
 ]
 # Batch size used for the keyset-paginated export query below - keeps
 # memory bounded (~batch_size rows in memory at a time) no matter how
@@ -223,7 +232,24 @@ def _active_alumni_export_query(db: Session, organization_id: str):
     )
 
 
-def _export_row(alumni: Alumni) -> list:
+def _profile_override(profile: UserProfile | None, show_flag: str, profile_field: str) -> str | None:
+    """Same privacy-respecting override rule used everywhere else (see
+    app.services.effective_alumni_service): only a nonblank profile
+    value, on a CONFIRMED link, with the owner's visibility flag on."""
+    if profile is None:
+        return None
+    if not getattr(profile, show_flag, False):
+        return None
+    value = getattr(profile, profile_field, None)
+    return value if value else None
+
+
+def _export_row(alumni: Alumni, profile: UserProfile | None) -> list:
+    profile_company = _profile_override(profile, "show_current_employer", "current_employer")
+    profile_job_title = _profile_override(profile, "show_job_title", "current_job_title")
+    profile_university = _profile_override(profile, "show_education", "current_university")
+    profile_city = _profile_override(profile, "show_location", "current_city")
+
     return [
         alumni.first_name,
         alumni.last_name,
@@ -242,6 +268,21 @@ def _export_row(alumni: Alumni) -> list:
         alumni.career_category_source,
         alumni.seniority,
         alumni.seniority_source,
+        # Effective-data layer (never overwrites the imported columns above).
+        alumni.company,
+        profile_company,
+        profile_company or alumni.company,
+        alumni.job_title,
+        profile_job_title,
+        profile_job_title or alumni.job_title,
+        alumni.university,
+        profile_university,
+        profile_university or alumni.university,
+        alumni.city,
+        profile_city,
+        profile_city or alumni.city,
+        profile.link_status if profile else LinkStatus.UNMATCHED,
+        profile.updated_at.isoformat() if profile and profile.updated_at else "",
     ]
 
 
@@ -281,8 +322,20 @@ def export_alumni(
             batch = query.limit(EXPORT_BATCH_SIZE).all()
             if not batch:
                 break
+
+            # One extra query per batch (not per row) for confirmed
+            # profile overrides - keeps this an O(rows / batch_size)
+            # query pattern even at 75,000+ rows, never N+1.
+            batch_ids = [alumni.id for alumni in batch]
+            confirmed_profiles = {
+                row.alumni_id: row
+                for row in db.query(UserProfile)
+                .filter(UserProfile.alumni_id.in_(batch_ids), UserProfile.link_status.in_(LinkStatus.CONFIRMED))
+                .all()
+            }
+
             for alumni in batch:
-                writer.writerow(_export_row(alumni))
+                writer.writerow(_export_row(alumni, confirmed_profiles.get(alumni.id)))
                 last_id = alumni.id
             yield buffer.getvalue()
 

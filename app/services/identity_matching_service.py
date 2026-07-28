@@ -13,13 +13,17 @@ MATCH POLICY
 ------------
 A candidate QUALIFIES for user confirmation if either:
   - STRONG: normalized email exact match, OR normalized LinkedIn URL
-    exact match, by itself.
+    exact match, by itself. (Still never auto-linked - a strong match is
+    just presented on the "Is this you?" confirmation screen like any
+    other candidate.)
   - STANDARD: normalized full name matches AND at least two of
-    {university, employer, job_title, city_state} also match exactly.
+    {university, employer, job_title, city_state, email, LinkedIn,
+    graduation_year} also match exactly.
 
 Three or more non-name fields matching, without a name match, is never
 enough by itself (prevents "two people at the same employer and
-university" false links).
+university" false links). Nothing here is ever auto-linked without an
+explicit POST /profile/me/confirm-match/{alumni_id} call.
 
 SCORING (documented, not used for automatic linking beyond the policy
 above - purely for ranking/transparency):
@@ -30,6 +34,7 @@ above - purely for ranking/transparency):
   employer exact           20
   job title exact          15
   city+state exact         10
+  graduation year exact    10
 """
 import re
 from dataclasses import dataclass, field
@@ -49,12 +54,33 @@ SCORE_UNIVERSITY_EXACT = 20
 SCORE_EMPLOYER_EXACT = 20
 SCORE_JOB_TITLE_EXACT = 15
 SCORE_CITY_STATE_EXACT = 10
+SCORE_GRADUATION_YEAR_EXACT = 10
 
-STANDARD_SIGNAL_FIELDS = ("university_exact", "employer_exact", "job_title_exact", "city_state_exact")
+# Every signal that can count toward the "at least two of" standard-match
+# requirement. Email/LinkedIn count here too (in addition to qualifying a
+# candidate on their own as a "strong" match) - see MATCH_POLICY above.
+STANDARD_SIGNAL_FIELDS = (
+    "university_exact", "employer_exact", "job_title_exact", "city_state_exact",
+    "email_exact", "linkedin_exact", "graduation_year_exact",
+)
 MIN_STANDARD_SIGNALS_REQUIRED = 2
 
 MATCH_TYPE_STRONG = "strong"
 MATCH_TYPE_STANDARD = "standard"
+
+# Human-readable field names for MatchCandidateOut.matched_fields /
+# nonmatching_fields - purely presentational, never used for scoring.
+SIGNAL_DISPLAY_NAMES = {
+    "email_exact": "email",
+    "linkedin_exact": "linkedin_url",
+    "full_name_exact": "full_name",
+    "university_exact": "university",
+    "employer_exact": "current_employer",
+    "job_title_exact": "job_title",
+    "city_state_exact": "location",
+    "graduation_year_exact": "graduation_year",
+}
+ALL_DISPLAY_FIELDS = tuple(SIGNAL_DISPLAY_NAMES.values())
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _NAME_PUNCTUATION_RE = re.compile(r"[.,'\u2019`]")
@@ -215,17 +241,36 @@ def score_candidate(profile: UserProfile, alumni: Alumni) -> MatchCandidate:
         signals.append("city_state_exact")
         score += SCORE_CITY_STATE_EXACT
 
+    grad_year_match = bool(
+        profile.graduation_year and alumni.graduation_year and profile.graduation_year == alumni.graduation_year
+    )
+    if grad_year_match:
+        signals.append("graduation_year_exact")
+        score += SCORE_GRADUATION_YEAR_EXACT
+
     match_type = None
     if email_match or linkedin_match:
         match_type = MATCH_TYPE_STRONG
     elif name_match:
+        # Email/LinkedIn also count toward the "at least two" standard
+        # requirement (in addition to qualifying alone as "strong") -
+        # they just didn't happen to match exactly in this branch.
         standard_signal_count = sum(
-            [university_match, employer_match, title_match, city_state_match]
+            [university_match, employer_match, title_match, city_state_match, grad_year_match]
         )
         if standard_signal_count >= MIN_STANDARD_SIGNALS_REQUIRED:
             match_type = MATCH_TYPE_STANDARD
 
     return MatchCandidate(alumni=alumni, score=score, matched_signals=signals, match_type=match_type)
+
+
+def matched_field_names(matched_signals: list[str]) -> list[str]:
+    return [SIGNAL_DISPLAY_NAMES[s] for s in matched_signals if s in SIGNAL_DISPLAY_NAMES]
+
+
+def nonmatching_field_names(matched_signals: list[str]) -> list[str]:
+    matched = set(matched_field_names(matched_signals))
+    return [name for name in ALL_DISPLAY_FIELDS if name not in matched]
 
 
 def compute_match_candidates(db: Session, profile: UserProfile) -> list[MatchCandidate]:

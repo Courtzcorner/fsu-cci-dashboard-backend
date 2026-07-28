@@ -18,6 +18,7 @@ from app.database import get_db
 from app.deps import CurrentUser, get_current_user
 from app.models.alumni import Alumni
 from app.models.user_profile import (
+    LinkStatus,
     ProfileMatchCandidate,
     UserEducationHistory,
     UserProfile,
@@ -31,11 +32,14 @@ from app.schemas.user_profile import (
     MatchCandidateOut,
     PrivacySettingsIn,
     PrivacySettingsOut,
+    ProfileEnvelopeOut,
     UserProfileOut,
     UserProfileUpdateRequest,
     WorkHistoryIn,
     WorkHistoryOut,
 )
+from app.services.effective_profile_service import recompute_profile_effective_fields
+from app.services.identity_matching_service import matched_field_names, nonmatching_field_names
 from app.services.profile_link_service import (
     confirm_match,
     find_and_persist_candidates,
@@ -76,7 +80,13 @@ def _to_profile_out(profile: UserProfile) -> UserProfileOut:
         current_job_title=profile.current_job_title,
         current_employer=profile.current_employer,
         current_university=profile.current_university,
+        degree=profile.degree,
+        field_of_study=profile.field_of_study,
+        graduation_year=profile.graduation_year,
         bio=profile.bio,
+        current_industry=profile.current_industry,
+        effective_industry_source=profile.effective_industry_source,
+        email=profile.primary_email,
         primary_email=profile.primary_email,
         secondary_email=profile.secondary_email,
         phone_number=profile.phone_number,
@@ -106,16 +116,22 @@ def _to_profile_out(profile: UserProfile) -> UserProfileOut:
     )
 
 
+def _to_envelope(profile: UserProfile) -> ProfileEnvelopeOut:
+    return ProfileEnvelopeOut(profile=_to_profile_out(profile), is_linked=profile.link_status in LinkStatus.CONFIRMED)
+
+
 def _candidate_rows_to_out(db: Session, rows: list[ProfileMatchCandidate]) -> list[MatchCandidateOut]:
     out = []
     for row in rows:
         alumni = db.get(Alumni, row.alumni_id)
         if alumni is None:
             continue
+        matched_signals = json.loads(row.matched_signals)
         out.append(
             MatchCandidateOut(
                 alumni_id=alumni.id,
                 full_name=alumni.full_name,
+                name=alumni.full_name,
                 university=alumni.university,
                 company=alumni.company,
                 job_title=alumni.job_title,
@@ -123,7 +139,11 @@ def _candidate_rows_to_out(db: Session, rows: list[ProfileMatchCandidate]) -> li
                 state=alumni.state,
                 match_type=row.match_type,
                 score=row.score,
-                matched_signals=json.loads(row.matched_signals),
+                match_score=row.score,
+                matched_signals=matched_signals,
+                matched_fields=matched_field_names(matched_signals),
+                nonmatching_fields=nonmatching_field_names(matched_signals),
+                confirmation_required=True,
             )
         )
     return out
@@ -134,27 +154,35 @@ def _candidate_rows_to_out(db: Session, rows: list[ProfileMatchCandidate]) -> li
 # --------------------------------------------------------------------------
 
 
-@router.get("/me", response_model=UserProfileOut)
+@router.get("/me", response_model=ProfileEnvelopeOut)
 def get_my_profile(
     current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> UserProfileOut:
+) -> ProfileEnvelopeOut:
+    """Always returns an editable profile, whether or not this account has
+    ever been linked to an alumni directory record - a directory link is
+    entirely optional. This endpoint auto-creates an empty UserProfile
+    row on first access; it never 404s just because `alumni_id` is null."""
     profile = _get_or_create_profile(db, current_user)
-    return _to_profile_out(profile)
+    return _to_envelope(profile)
 
 
-@router.put("/me", response_model=UserProfileOut)
+@router.put("/me", response_model=ProfileEnvelopeOut)
 def update_my_profile(
     payload: UserProfileUpdateRequest,
     current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> UserProfileOut:
+) -> ProfileEnvelopeOut:
+    """Saves profile fields regardless of link status - linking to an
+    alumni record is never a prerequisite for filling out or editing a
+    profile."""
     profile = _get_or_create_profile(db, current_user)
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(profile, field, value)
+    recompute_profile_effective_fields(db, profile)
     db.commit()
     db.refresh(profile)
-    return _to_profile_out(profile)
+    return _to_envelope(profile)
 
 
 @router.get("/me/privacy", response_model=PrivacySettingsOut)

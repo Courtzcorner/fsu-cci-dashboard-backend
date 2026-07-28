@@ -104,7 +104,11 @@ class UserProfileUpdateRequest(BaseModel):
     current_job_title: Optional[str] = Field(None, max_length=255)
     current_employer: Optional[str] = Field(None, max_length=255)
     current_university: Optional[str] = Field(None, max_length=255)
+    degree: Optional[str] = Field(None, max_length=255)
+    field_of_study: Optional[str] = Field(None, max_length=255)
+    graduation_year: Optional[int] = None
     bio: Optional[str] = Field(None, max_length=4000)
+    current_industry: Optional[str] = Field(None, max_length=255)
 
     primary_email: Optional[str] = Field(None, max_length=255)
     secondary_email: Optional[str] = Field(None, max_length=255)
@@ -145,7 +149,16 @@ class UserProfileOut(BaseModel):
     current_job_title: Optional[str] = None
     current_employer: Optional[str] = None
     current_university: Optional[str] = None
+    degree: Optional[str] = None
+    field_of_study: Optional[str] = None
+    graduation_year: Optional[int] = None
     bio: Optional[str] = None
+    current_industry: Optional[str] = None
+    effective_industry_source: Optional[str] = None
+
+    # Convenience alias for primary_email, matching the field name the
+    # frontend expects on the "general" profile object.
+    email: Optional[str] = None
 
     primary_email: Optional[str] = None
     secondary_email: Optional[str] = None
@@ -183,9 +196,20 @@ class UserProfileOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ProfileEnvelopeOut(BaseModel):
+    """Always returned by GET/PUT /profile/me, even for a brand-new,
+    completely unmatched user - a profile is never gated behind having
+    a linked alumni record."""
+
+    profile: UserProfileOut
+    is_linked: bool
+
+
 class MatchCandidateOut(BaseModel):
     alumni_id: str
     full_name: str
+    # Backward-compatible alias of full_name.
+    name: str
     university: Optional[str] = None
     company: Optional[str] = None
     job_title: Optional[str] = None
@@ -193,7 +217,15 @@ class MatchCandidateOut(BaseModel):
     state: Optional[str] = None
     match_type: str
     score: int
+    # Backward-compatible alias of score.
+    match_score: int
     matched_signals: list[str]
+    # Human-readable versions of matched_signals (e.g. "full_name",
+    # "university", "current_employer") for direct display on the "Is
+    # this you?" confirmation screen.
+    matched_fields: list[str] = []
+    nonmatching_fields: list[str] = []
+    confirmation_required: bool = True
 
 
 class FindMatchResponse(BaseModel):

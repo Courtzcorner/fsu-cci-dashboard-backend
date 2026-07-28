@@ -55,7 +55,13 @@ def _auth(token):
 def _put_my_profile(client, token, **fields):
     response = client.put("/profile/me", json=fields, headers=_auth(token))
     assert response.status_code == 200, response.text
-    return response.json()
+    return response.json()["profile"]
+
+
+def _get_my_profile(client, token):
+    response = client.get("/profile/me", headers=_auth(token))
+    assert response.status_code == 200, response.text
+    return response.json()["profile"]
 
 
 # --------------------------------------------------------------------------
@@ -214,9 +220,9 @@ def test_user_confirmation_creates_the_link(client, organization, admin_user, db
     assert body["link_status"] == "user_confirmed"
     assert body["alumni_id"] == alumni_id
 
-    profile_response = client.get("/profile/me", headers=_auth(user_token))
-    assert profile_response.json()["alumni_id"] == alumni_id
-    assert profile_response.json()["link_status"] == "user_confirmed"
+    profile = _get_my_profile(client, user_token)
+    assert profile["alumni_id"] == alumni_id
+    assert profile["link_status"] == "user_confirmed"
 
 
 def test_second_user_cannot_claim_already_confirmed_alumni(client, organization, admin_user, db_session):
@@ -236,12 +242,12 @@ def test_second_user_cannot_claim_already_confirmed_alumni(client, organization,
     second_confirm = client.post(f"/profile/me/confirm-match/{alumni_id}", headers=_auth(second_token))
     assert second_confirm.status_code == 409
 
-    second_profile = client.get("/profile/me", headers=_auth(second_token)).json()
+    second_profile = _get_my_profile(client, second_token)
     assert second_profile["link_status"] == "conflict"
     assert second_profile["alumni_id"] is None
 
     # The first (legitimate) confirmation is untouched.
-    first_profile = client.get("/profile/me", headers=_auth(first_token)).json()
+    first_profile = _get_my_profile(client, first_token)
     assert first_profile["link_status"] == "user_confirmed"
     assert first_profile["alumni_id"] == alumni_id
 
@@ -313,7 +319,7 @@ def test_unlinking_does_not_delete_either_record(client, organization, admin_use
     assert response.status_code == 200
     assert response.json()["link_status"] == "unmatched"
 
-    profile = client.get("/profile/me", headers=_auth(owner_token)).json()
+    profile = _get_my_profile(client, owner_token)
     assert profile["alumni_id"] is None
 
     assert db_session.get(Alumni, alumni_id) is not None
@@ -330,7 +336,7 @@ def test_csv_reimport_preserves_a_valid_link(client, organization, admin_user, d
     # in place rather than creating a new one - the primary key survives).
     _upload_csv(client, admin_token, [_csv_row(email="stableid@example.com", first="stableid", last="Test")])
 
-    profile = client.get("/profile/me", headers=_auth(owner_token)).json()
+    profile = _get_my_profile(client, owner_token)
     assert profile["alumni_id"] == alumni_id
     assert profile["link_status"] == "user_confirmed"
     assert profile["needs_review"] is False
@@ -355,7 +361,7 @@ def test_deactivated_linked_alumni_is_marked_for_review(client, organization, ad
     assert alumni is not None
     assert alumni.is_active is False
 
-    profile = client.get("/profile/me", headers=_auth(owner_token)).json()
+    profile = _get_my_profile(client, owner_token)
     assert profile["alumni_id"] == alumni_id  # never silently reassigned
     assert profile["needs_review"] is True
 
@@ -389,7 +395,7 @@ def test_admin_can_approve_a_candidate_link(client, organization, admin_user, db
     _put_my_profile(client, user_token, primary_email="adminapprove@example.com")
     result = client.post("/profile/me/find-match", headers=_auth(user_token)).json()
     alumni_id = result["candidates"][0]["alumni_id"]
-    profile = client.get("/profile/me", headers=_auth(user_token)).json()
+    profile = _get_my_profile(client, user_token)
 
     response = client.post(
         f"/admin/profile-links/{profile['id']}/approve",
@@ -405,7 +411,7 @@ def test_admin_can_approve_a_candidate_link(client, organization, admin_user, db
 def test_admin_can_reject_and_unlink(client, organization, admin_user, db_session):
     admin_token = _login(client, "admin", "AdminPass123!")
     owner_token, alumni_id = _confirmed_alumni_id(client, db_session, organization, admin_token, "adminunlink")
-    profile = client.get("/profile/me", headers=_auth(owner_token)).json()
+    profile = _get_my_profile(client, owner_token)
 
     response = client.delete(f"/admin/profile-links/{profile['id']}", headers=_auth(admin_token))
     assert response.status_code == 200

@@ -31,8 +31,26 @@ renamed away):
 
     python scripts/seed_temporary_accounts.py --repair-seed-usernames
 
---repair-seed-usernames is mutually exclusive with --force-reset and
-takes priority if both are passed.
+To permanently DELETE only the five ORIGINAL broken temporary seed
+accounts (Eberanderee, EllieWebb, Bellabozied, OwenV, EbeAlum -
+deliberately NOT courtneystokes, and NOT any other user) so they can be
+recreated cleanly from scratch by a normal seed run afterward. Matching
+is by CURRENT username only, case insensitively - an account that has
+already renamed itself away from one of these five names is left
+completely untouched. See app.seed.temporary_accounts.delete_broken_seed_users
+for the exact, narrowly-scoped rules:
+
+    python scripts/seed_temporary_accounts.py --delete-broken-seed-users
+
+After deleting, re-create the five accounts cleanly with a normal seed
+run:
+
+    python scripts/seed_temporary_accounts.py
+
+--repair-seed-usernames, --delete-broken-seed-users, and --force-reset
+are mutually exclusive. If more than one is passed, priority is
+--delete-broken-seed-users, then --repair-seed-usernames, then
+--force-reset.
 """
 import argparse
 import sys
@@ -41,7 +59,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.database import SessionLocal  # noqa: E402
-from app.seed.temporary_accounts import repair_seed_usernames, seed_temporary_accounts  # noqa: E402
+from app.seed.temporary_accounts import (  # noqa: E402
+    delete_broken_seed_users,
+    repair_seed_usernames,
+    seed_temporary_accounts,
+)
 
 
 def main() -> None:
@@ -60,11 +82,22 @@ def main() -> None:
         "must_change_credentials). Never creates a duplicate, never touches any other user, "
         "never touches an account that already completed setup and renamed away.",
     )
+    parser.add_argument(
+        "--delete-broken-seed-users",
+        action="store_true",
+        help="Permanently delete ONLY the five original broken temporary seed accounts "
+        "(Eberanderee, EllieWebb, Bellabozied, OwenV, EbeAlum) so they can be recreated cleanly "
+        "with a normal seed run afterward. Never touches courtneystokes, any other user, or any "
+        "account that has already renamed itself away from one of these five usernames.",
+    )
     args = parser.parse_args()
 
     db = SessionLocal()
     try:
-        if args.repair_seed_usernames:
+        if args.delete_broken_seed_users:
+            results = delete_broken_seed_users(db)
+            print("Broken temporary seed account deletion results:")
+        elif args.repair_seed_usernames:
             results = repair_seed_usernames(db)
             print("Temporary account repair results:")
         else:

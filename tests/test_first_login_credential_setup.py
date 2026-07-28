@@ -10,9 +10,16 @@ admin/alumni route protection, CSV import, profile linking, analytics, or
 CORS - they only prove the new temporary-credential flow works correctly
 on top of them.
 """
+from app.models.alumni import Alumni
 from app.models.user import User
 from app.security import hash_password, verify_password
-from app.seed.temporary_accounts import TEMPORARY_ACCOUNTS, repair_seed_usernames, seed_temporary_accounts
+from app.seed.temporary_accounts import (
+    BROKEN_SEED_USERNAMES,
+    TEMPORARY_ACCOUNTS,
+    delete_broken_seed_users,
+    repair_seed_usernames,
+    seed_temporary_accounts,
+)
 from tests.conftest import ADMIN_PASSWORD, ADMIN_USERNAME
 
 TEMP_PASSWORD = "testtest"
@@ -517,3 +524,126 @@ def test_repair_creates_a_wholly_missing_seed_account(client, db_session):
     assert user is not None
     assert user.role == "alumni"
     assert user.must_change_credentials is True
+
+
+# --------------------------------------------------------------------------
+# --delete-broken-seed-users: permanently deletes ONLY the five original
+# broken temporary seed accounts so they can be recreated cleanly.
+# --------------------------------------------------------------------------
+
+
+def test_the_five_exact_usernames_are_deleted(client, db_session):
+    _seed(db_session)
+
+    outcomes = dict(delete_broken_seed_users(db_session))
+    assert outcomes == {username: "deleted" for username in BROKEN_SEED_USERNAMES}
+
+    for username in BROKEN_SEED_USERNAMES:
+        assert db_session.query(User).filter(User.username == username).first() is None
+
+
+def test_courtneystokes_remains_untouched_by_delete(client, db_session):
+    _seed(db_session)
+
+    delete_broken_seed_users(db_session)
+
+    courtney = db_session.query(User).filter(User.username == "courtneystokes").first()
+    assert courtney is not None
+    assert courtney.must_change_credentials is True
+
+
+def test_delete_does_not_touch_unrelated_users(client, admin_user, db_session):
+    _seed(db_session)
+    admin_password_hash_before = admin_user.password_hash
+    admin_role_before = admin_user.role
+
+    delete_broken_seed_users(db_session)
+
+    db_session.refresh(admin_user)
+    assert admin_user.password_hash == admin_password_hash_before
+    assert admin_user.role == admin_role_before
+
+
+def test_delete_does_not_touch_a_renamed_account(client, db_session):
+    _seed(db_session)
+    token = _login_temp(client, "EllieWebb").json()["access_token"]
+    client.post(
+        "/auth/complete-first-login",
+        json={"new_username": "ellie.safe", "new_password": STRONG_PASSWORD, "confirm_password": STRONG_PASSWORD},
+        headers=_auth(token),
+    )
+
+    renamed_before = db_session.query(User).filter(User.username == "ellie.safe").first()
+    password_hash_before = renamed_before.password_hash
+
+    outcomes = dict(delete_broken_seed_users(db_session))
+    assert outcomes["EllieWebb"] == "skipped_renamed"
+
+    db_session.refresh(renamed_before)
+    assert renamed_before.username == "ellie.safe"
+    assert renamed_before.password_hash == password_hash_before
+
+    # The remaining four (still under their original temporary username)
+    # are unaffected by "EllieWebb" being skipped.
+    for username in ("Eberanderee", "Bellabozied", "OwenV", "EbeAlum"):
+        assert outcomes[username] == "deleted"
+
+
+def test_delete_does_not_touch_imported_alumni_records(client, db_session):
+    _seed(db_session)
+    alumni = Alumni(first_name="Jane", last_name="Doe", full_name="Jane Doe", is_active=True)
+    db_session.add(alumni)
+    db_session.commit()
+    alumni_id = alumni.id
+
+    delete_broken_seed_users(db_session)
+
+    still_there = db_session.query(Alumni).filter(Alumni.id == alumni_id).first()
+    assert still_there is not None
+    assert still_there.is_active is True
+
+
+def test_running_the_delete_twice_is_safe(client, db_session):
+    _seed(db_session)
+
+    first = dict(delete_broken_seed_users(db_session))
+    assert all(outcome == "deleted" for outcome in first.values())
+
+    second = dict(delete_broken_seed_users(db_session))
+    assert all(outcome == "not_found" for outcome in second.values())
+
+
+def test_normal_seed_recreates_the_five_deleted_accounts(client, db_session):
+    _seed(db_session)
+    delete_broken_seed_users(db_session)
+
+    results = dict(_seed(db_session))
+    for username in BROKEN_SEED_USERNAMES:
+        assert results[username] == "created"
+        assert db_session.query(User).filter(User.username == username).first() is not None
+
+
+def test_recreated_accounts_can_log_in_with_testtest(client, db_session):
+    _seed(db_session)
+    delete_broken_seed_users(db_session)
+    _seed(db_session)
+
+    response = _login_temp(client, "EllieWebb")
+    assert response.status_code == 200, response.text
+    assert response.json()["user"]["must_change_credentials"] is True
+
+
+def test_recreated_accounts_have_the_correct_roles(client, db_session):
+    _seed(db_session)
+    delete_broken_seed_users(db_session)
+    _seed(db_session)
+
+    expected_roles = {spec.username: spec.role for spec in TEMPORARY_ACCOUNTS}
+    for username in BROKEN_SEED_USERNAMES:
+        user = db_session.query(User).filter(User.username == username).first()
+        assert user.role == expected_roles[username]
+
+
+def test_delete_not_found_when_account_never_existed(client, db_session):
+    outcomes = dict(delete_broken_seed_users(db_session))
+    assert outcomes == {username: "not_found" for username in BROKEN_SEED_USERNAMES}

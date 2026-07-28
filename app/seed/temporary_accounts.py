@@ -25,15 +25,21 @@ from sqlalchemy.orm import Session
 
 from app.models.mixins import utcnow
 from app.models.user import User
-from app.security import hash_password
+from app.models.user_profile import ProfileMatchCandidate, UserEducationHistory, UserProfile, UserWorkHistory
+from app.security import hash_password, verify_password
 from app.services.audit_service import record_audit_log
-from app.security import verify_password
 from app.services.credential_setup_service import TEMPORARY_PASSWORD
 
 SeedOutcome = Literal["created", "reset", "unchanged", "already_completed"]
 RepairOutcome = Literal[
     "created", "repaired", "already_pending", "completed_and_renamed", "role_conflict", "not_found"
 ]
+DeleteOutcome = Literal["deleted", "not_found", "skipped_renamed"]
+
+# The five ORIGINAL broken temporary seed usernames - deliberately does
+# NOT include "courtneystokes" (added later, never reported broken) or
+# any other account.
+BROKEN_SEED_USERNAMES: tuple[str, ...] = ("Eberanderee", "EllieWebb", "Bellabozied", "OwenV", "EbeAlum")
 
 
 @dataclass(frozen=True)
@@ -227,6 +233,86 @@ def repair_seed_usernames(db: Session) -> list[tuple[str, RepairOutcome]]:
             details={"username": user.username, "role": user.role},
         )
         results.append((spec.username, "repaired"))
+
+    db.commit()
+    return results
+
+
+def delete_broken_seed_users(db: Session) -> list[tuple[str, DeleteOutcome]]:
+    """Permanently deletes ONLY the five original broken temporary seed
+    accounts (BROKEN_SEED_USERNAMES) so they can be recreated cleanly by
+    `seed_temporary_accounts()`. Deliberately excludes "courtneystokes"
+    and every other user in the system.
+
+    Matching is by CURRENT username only (case insensitive) - an account
+    is never deleted based on `previous_username` alone, and an account
+    that has already renamed itself away from one of these five names is
+    left completely untouched (reported as "skipped_renamed", not
+    deleted, not recreated).
+
+    Dependent rows are cleaned up ONLY as required by the `users` table's
+    foreign keys - each of these broken accounts predates the
+    first-login flow, so in practice none of them ever has a UserProfile
+    row, but this is handled defensively (and explicitly, rather than
+    relying on the database's ON DELETE CASCADE configuration) in case
+    one was created:
+      - UserProfile (if any) for that user_id, plus its child
+        UserWorkHistory / UserEducationHistory / ProfileMatchCandidate
+        rows.
+    Nothing else is touched: `alumni` (imported CSV directory data),
+    `csv_imports`, `audit_logs`, and every other user's own
+    UserProfile/relationships are completely unaffected. The whole batch
+    is committed atomically - either every matched account (and its
+    dependents) is deleted, or (on error) none of them are.
+    """
+    results: list[tuple[str, DeleteOutcome]] = []
+    to_delete: list[User] = []
+
+    for username in BROKEN_SEED_USERNAMES:
+        user = db.query(User).filter(func.lower(User.username) == username.lower()).first()
+
+        if user is not None:
+            print(f"Will delete: {user.username} (id={user.id}, role={user.role})")
+            to_delete.append(user)
+            results.append((username, "deleted"))
+            continue
+
+        # Never deleted, and never recreated by this command - an account
+        # that has already completed setup and renamed away from this
+        # username is out of scope entirely.
+        renamed = db.query(User).filter(func.lower(User.previous_username) == username.lower()).first()
+        if renamed is not None:
+            results.append((username, "skipped_renamed"))
+        else:
+            results.append((username, "not_found"))
+
+    for user in to_delete:
+        profile = db.query(UserProfile).filter(UserProfile.user_id == user.id).first()
+        if profile is not None:
+            db.query(ProfileMatchCandidate).filter(ProfileMatchCandidate.user_profile_id == profile.id).delete(
+                synchronize_session=False
+            )
+            db.query(UserWorkHistory).filter(UserWorkHistory.user_profile_id == profile.id).delete(
+                synchronize_session=False
+            )
+            db.query(UserEducationHistory).filter(UserEducationHistory.user_profile_id == profile.id).delete(
+                synchronize_session=False
+            )
+            db.delete(profile)
+
+        # user_id=None (not the row about to be deleted) - AuditLog.user_id
+        # is a nullable FK to users.id; entity_id is a plain string column
+        # (not an FK), so it safely retains the deleted user's id for the
+        # audit trail.
+        record_audit_log(
+            db,
+            user_id=None,
+            action="temporary_account_deleted",
+            entity_type="user",
+            entity_id=user.id,
+            details={"username": user.username, "role": user.role},
+        )
+        db.delete(user)
 
     db.commit()
     return results

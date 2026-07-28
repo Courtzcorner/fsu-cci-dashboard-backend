@@ -24,15 +24,15 @@ class CurrentUser:
     username: str
     role: str
     alumni_id: str | None
+    must_change_credentials: bool = False
 
     @property
     def is_admin(self) -> bool:
         return self.role == "admin"
 
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: Session = Depends(get_db),
+def _resolve_current_user(
+    credentials: HTTPAuthorizationCredentials, db: Session
 ) -> CurrentUser:
     if credentials is None or not credentials.credentials:
         raise HTTPException(
@@ -58,10 +58,59 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Tokens minted before the `tv` claim existed carry no "tv" value at
+    # all - treated as 0, which matches every pre-existing user's default
+    # `token_version`, so no session issued before this feature shipped
+    # is broken. A token is only ever rejected here if `token_version` has
+    # since been bumped (POST /auth/logout, or completing first-login
+    # credential setup) - i.e. it was deliberately revoked.
+    if payload.get("tv", 0) != user.token_version:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session has been revoked. Please sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     # Role/alumni_id are always read fresh from the database rather than
     # trusted from the (possibly stale) JWT claims, so an admin change to
     # either takes effect on the very next request.
-    return CurrentUser(id=user.id, username=user.username, role=user.role, alumni_id=user.alumni_id)
+    return CurrentUser(
+        id=user.id,
+        username=user.username,
+        role=user.role,
+        alumni_id=user.alumni_id,
+        must_change_credentials=user.must_change_credentials,
+    )
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> CurrentUser:
+    """The dependency used by every dashboard/profile/analytics/admin
+    route. A temporary account that has not yet completed
+    POST /auth/complete-first-login is authenticated but explicitly
+    denied here - server-side, not just by a frontend redirect - so its
+    token cannot be used against any route other than the three exempted
+    ones in app.routers.auth_routes that use
+    `get_current_user_allow_pending_credentials` instead."""
+    current_user = _resolve_current_user(credentials, db)
+    if current_user.must_change_credentials:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Credential setup required before accessing this resource",
+        )
+    return current_user
+
+
+def get_current_user_allow_pending_credentials(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> CurrentUser:
+    """Identical to get_current_user, but does NOT block accounts that
+    still have must_change_credentials=True. Only ever used by
+    GET /auth/me, POST /auth/complete-first-login, and POST /auth/logout."""
+    return _resolve_current_user(credentials, db)
 
 
 def get_organization_by_slug_for_current_user(

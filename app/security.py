@@ -26,8 +26,16 @@ class TokenError(Exception):
     """Raised when a JWT is missing, malformed, expired, or invalid."""
 
 
-def create_access_token(username: str, role: str, expires_delta: Optional[timedelta] = None) -> tuple[str, int]:
-    """Create a signed JWT carrying the username (`sub`) and `role` claims.
+def create_access_token(
+    username: str, role: str, token_version: int = 0, expires_delta: Optional[timedelta] = None
+) -> tuple[str, int]:
+    """Create a signed JWT carrying the username (`sub`), `role`, and
+    `tv` (token_version) claims.
+
+    `tv` is a minimal additive claim: bumping a user's `token_version`
+    column invalidates every token minted with an older value (see
+    app.deps.get_current_user), without any change to the existing
+    `sub`/`role`/`iat`/`exp` claim structure or the signing algorithm.
 
     Returns (token, expires_in_seconds).
     """
@@ -37,6 +45,7 @@ def create_access_token(username: str, role: str, expires_delta: Optional[timede
     payload: dict[str, Any] = {
         "sub": username,
         "role": role,
+        "tv": token_version,
         "iat": datetime.now(timezone.utc),
         "exp": expire,
     }

@@ -19,7 +19,7 @@ from app.models.legal_name import LegalNameChangeRequest
 from app.models.organization import Organization
 from app.models.user import User
 from app.models.user_profile import LinkStatus, ProfileMatchCandidate, UserProfile
-from app.schemas.admin import CurrentImportOut, ImportResult, NormalizeLocationsResult, RowError
+from app.schemas.admin import CurrentImportOut, ImportResult, NormalizeLocationsResult, RowError, UserAdminOut
 from app.schemas.profile import LegalNameChangeRequestOut
 from app.schemas.user_profile import AdminProfileLinkActionOut, AdminProfileMatchCandidateOut, MatchCandidateOut
 from app.services.audit_service import record_audit_log
@@ -64,6 +64,33 @@ def _get_default_organization(db: Session) -> Organization:
     compatibility), but that value is never taken from client input.
     """
     return _resolve_organization(db, get_settings().default_organization_slug)
+
+
+@router.get("/users", response_model=list[UserAdminOut])
+def list_users(
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[UserAdminOut]:
+    """Every login account's current state, including its up-to-date
+    username after a first-login credential setup - never a password or
+    password hash."""
+    require_admin_role(current_user)
+    users = db.query(User).order_by(User.username.asc()).all()
+    return [
+        UserAdminOut(
+            id=user.id,
+            username=user.username,
+            role=user.role,
+            is_active=user.is_active,
+            alumni_id=user.alumni_id,
+            must_change_credentials=user.must_change_credentials,
+            temporary_account_created_at=user.temporary_account_created_at,
+            credentials_updated_at=user.credentials_updated_at,
+            previous_username=user.previous_username,
+            username_changed_at=user.username_changed_at,
+        )
+        for user in users
+    ]
 
 
 @router.post("/import-alumni", response_model=ImportResult)

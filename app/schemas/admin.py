@@ -1,4 +1,24 @@
+from datetime import datetime
+
 from pydantic import BaseModel
+
+
+class UserAdminOut(BaseModel):
+    """Admin-facing user listing. Never includes `password_hash` or any
+    other credential material - only the current login name and
+    credential-setup state, so an admin can see a temporary account's
+    updated username without asking the user directly."""
+
+    id: str
+    username: str
+    role: str
+    is_active: bool
+    alumni_id: str | None = None
+    must_change_credentials: bool
+    temporary_account_created_at: datetime | None = None
+    credentials_updated_at: datetime | None = None
+    previous_username: str | None = None
+    username_changed_at: datetime | None = None
 
 
 class RowError(BaseModel):

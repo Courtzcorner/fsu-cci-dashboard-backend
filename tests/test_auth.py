@@ -14,7 +14,13 @@ def test_successful_login_returns_exact_response_shape(client, admin_user):
     assert set(body.keys()) == {"access_token", "token_type", "expires_in", "user"}
     assert body["token_type"] == "bearer"
     assert body["expires_in"] == 3600
-    assert body["user"] == {"username": "admin", "role": "admin"}
+    # `id` and `must_change_credentials` are additive fields on the user
+    # object - a normal (non-temporary) account always gets
+    # must_change_credentials=False.
+    assert body["user"]["username"] == "admin"
+    assert body["user"]["role"] == "admin"
+    assert body["user"]["must_change_credentials"] is False
+    assert body["user"]["id"] == admin_user.id
 
 
 def test_jwt_contains_username_and_role_claims(client, admin_user):

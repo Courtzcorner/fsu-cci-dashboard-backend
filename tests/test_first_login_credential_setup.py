@@ -874,3 +874,120 @@ def test_third_batch_does_not_affect_earlier_batches_or_permanent_users(client, 
     for spec in TEMPORARY_ACCOUNTS:
         matches = db_session.query(User).filter(User.username == spec.username).all()
         assert len(matches) == 1
+
+
+# --------------------------------------------------------------------------
+# Fourth additive batch of temporary accounts: EbeR (admin), EbeRan
+# (alumni). Created through the exact same `seed_temporary_accounts()`
+# path/config as every other temporary account above - no new code, just
+# two more entries in TEMPORARY_ACCOUNTS. Usernames are intentionally
+# case-sensitive-looking near-duplicates of each other and of earlier
+# "Eberanderee"-style names - exercised explicitly below to confirm the
+# seed treats them as their own exact, distinct usernames.
+# --------------------------------------------------------------------------
+
+FOURTH_BATCH_ADMIN_USERNAME = "EbeR"
+FOURTH_BATCH_ALUMNI_USERNAME = "EbeRan"
+FOURTH_BATCH_USERNAMES = (FOURTH_BATCH_ADMIN_USERNAME, FOURTH_BATCH_ALUMNI_USERNAME)
+
+
+def test_eber_is_created_as_admin(client, db_session):
+    _seed(db_session)
+    user = db_session.query(User).filter(User.username == "EbeR").first()
+    assert user is not None
+    assert user.role == "admin"
+
+
+def test_eberan_is_created_as_alumni(client, db_session):
+    _seed(db_session)
+    user = db_session.query(User).filter(User.username == "EbeRan").first()
+    assert user is not None
+    assert user.role == "alumni"
+
+
+def test_both_fourth_batch_accounts_can_log_in_with_testtest(client, db_session):
+    _seed(db_session)
+    for username in FOURTH_BATCH_USERNAMES:
+        response = _login_temp(client, username)
+        assert response.status_code == 200, response.text
+
+
+def test_both_fourth_batch_accounts_require_credential_change(client, db_session):
+    _seed(db_session)
+    for username in FOURTH_BATCH_USERNAMES:
+        response = _login_temp(client, username)
+        body = response.json()
+        assert body["user"]["must_change_credentials"] is True
+
+
+def test_fourth_batch_passwords_are_hashed_and_never_plaintext(client, db_session):
+    _seed(db_session)
+    for username in FOURTH_BATCH_USERNAMES:
+        user = db_session.query(User).filter(User.username == username).first()
+        assert user.password_hash != "testtest"
+        assert user.password_hash.startswith("$2b$")
+        assert verify_password("testtest", user.password_hash)
+
+
+def test_fourth_batch_accounts_have_correct_credential_state(client, db_session):
+    _seed(db_session)
+    for username in FOURTH_BATCH_USERNAMES:
+        user = db_session.query(User).filter(User.username == username).first()
+        assert user.must_change_credentials is True
+        assert user.temporary_account_created_at is not None
+        assert user.credentials_updated_at is None
+        assert user.previous_username is None
+        assert user.username_changed_at is None
+        assert user.alumni_id is None
+
+
+def test_running_the_seed_twice_creates_no_duplicates_for_fourth_batch(client, db_session):
+    _seed(db_session)
+    _seed(db_session)
+    for username in FOURTH_BATCH_USERNAMES:
+        matches = db_session.query(User).filter(User.username == username).all()
+        assert len(matches) == 1
+
+
+def test_fourth_batch_existing_account_is_left_untouched_and_reported(client, db_session):
+    # Simulate "EbeRan" already existing (e.g. a manually created row) -
+    # the seed must never overwrite its password or role, and must
+    # report it rather than silently skipping.
+    existing = User(username="EbeRan", password_hash=hash_password("SomeOtherPass1"), role="alumni")
+    db_session.add(existing)
+    db_session.commit()
+    existing_password_hash = existing.password_hash
+
+    results = dict(_seed(db_session))
+    assert results["EbeRan"] == "already_completed"
+
+    db_session.refresh(existing)
+    assert existing.password_hash == existing_password_hash
+    assert existing.role == "alumni"
+    assert existing.must_change_credentials is False
+
+
+def test_fourth_batch_usernames_are_distinct_from_similarly_named_earlier_accounts(client, db_session):
+    # "EbeR"/"EbeRan" must never be confused with the earlier
+    # "Eberanderee"/"EbeAlum" temporary accounts - all four must exist as
+    # separate, independent rows.
+    _seed(db_session)
+    usernames = {"EbeR", "EbeRan", "Eberanderee", "EbeAlum"}
+    for username in usernames:
+        matches = db_session.query(User).filter(User.username == username).all()
+        assert len(matches) == 1, f"expected exactly one row for {username!r}, found {len(matches)}"
+
+
+def test_fourth_batch_does_not_affect_earlier_batches_or_permanent_users(client, admin_user, db_session):
+    admin_password_hash_before = admin_user.password_hash
+    admin_role_before = admin_user.role
+
+    _seed(db_session)
+
+    db_session.refresh(admin_user)
+    assert admin_user.password_hash == admin_password_hash_before
+    assert admin_user.role == admin_role_before
+
+    for spec in TEMPORARY_ACCOUNTS:
+        matches = db_session.query(User).filter(User.username == spec.username).all()
+        assert len(matches) == 1

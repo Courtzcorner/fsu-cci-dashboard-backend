@@ -991,3 +991,89 @@ def test_fourth_batch_does_not_affect_earlier_batches_or_permanent_users(client,
     for spec in TEMPORARY_ACCOUNTS:
         matches = db_session.query(User).filter(User.username == spec.username).all()
         assert len(matches) == 1
+
+
+# --------------------------------------------------------------------------
+# Fifth additive batch of temporary accounts: jordanl (alumni). Created
+# through the exact same `seed_temporary_accounts()` path/config as every
+# other temporary account above - no new code, just one more entry in
+# TEMPORARY_ACCOUNTS.
+# --------------------------------------------------------------------------
+
+
+def test_jordanl_is_created_as_alumni(client, db_session):
+    _seed(db_session)
+    user = db_session.query(User).filter(User.username == "jordanl").first()
+    assert user is not None
+    assert user.role == "alumni"
+
+
+def test_jordanl_can_log_in_with_testtest(client, db_session):
+    _seed(db_session)
+    response = _login_temp(client, "jordanl")
+    assert response.status_code == 200, response.text
+
+
+def test_jordanl_requires_credential_change(client, db_session):
+    _seed(db_session)
+    response = _login_temp(client, "jordanl")
+    assert response.json()["user"]["must_change_credentials"] is True
+
+
+def test_jordanl_password_is_hashed_and_never_plaintext(client, db_session):
+    _seed(db_session)
+    user = db_session.query(User).filter(User.username == "jordanl").first()
+    assert user.password_hash != "testtest"
+    assert user.password_hash.startswith("$2b$")
+    assert verify_password("testtest", user.password_hash)
+
+
+def test_jordanl_has_correct_credential_state(client, db_session):
+    _seed(db_session)
+    user = db_session.query(User).filter(User.username == "jordanl").first()
+    assert user.must_change_credentials is True
+    assert user.temporary_account_created_at is not None
+    assert user.credentials_updated_at is None
+    assert user.previous_username is None
+    assert user.username_changed_at is None
+    assert user.alumni_id is None
+
+
+def test_running_the_seed_twice_creates_no_duplicate_jordanl(client, db_session):
+    _seed(db_session)
+    _seed(db_session)
+    matches = db_session.query(User).filter(User.username == "jordanl").all()
+    assert len(matches) == 1
+
+
+def test_jordanl_existing_account_is_left_untouched_and_reported(client, db_session):
+    # Simulate "jordanl" already existing (e.g. a manually created row) -
+    # the seed must never overwrite its password or role, and must
+    # report it rather than silently skipping.
+    existing = User(username="jordanl", password_hash=hash_password("SomeOtherPass1"), role="alumni")
+    db_session.add(existing)
+    db_session.commit()
+    existing_password_hash = existing.password_hash
+
+    results = dict(_seed(db_session))
+    assert results["jordanl"] == "already_completed"
+
+    db_session.refresh(existing)
+    assert existing.password_hash == existing_password_hash
+    assert existing.role == "alumni"
+    assert existing.must_change_credentials is False
+
+
+def test_fifth_batch_does_not_affect_earlier_batches_or_permanent_users(client, admin_user, db_session):
+    admin_password_hash_before = admin_user.password_hash
+    admin_role_before = admin_user.role
+
+    _seed(db_session)
+
+    db_session.refresh(admin_user)
+    assert admin_user.password_hash == admin_password_hash_before
+    assert admin_user.role == admin_role_before
+
+    for spec in TEMPORARY_ACCOUNTS:
+        matches = db_session.query(User).filter(User.username == spec.username).all()
+        assert len(matches) == 1

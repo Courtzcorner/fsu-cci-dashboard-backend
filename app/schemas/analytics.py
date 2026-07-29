@@ -70,6 +70,39 @@ class DataQuality(BaseModel):
     unclassified_seniority: int = 0
 
 
+class CompanyIndustryOverview(BaseModel):
+    """Snapshot of how well the active dataset's company/industry fields
+    are populated - every count is a direct SQL COUNT/COUNT(DISTINCT)
+    over the active dataset, never estimated."""
+
+    unique_companies: int = 0
+    classified_industries: int = 0
+    alumni_with_company: int = 0
+    alumni_with_industry: int = 0
+    company_coverage_percentage: float = 0.0
+    industry_coverage_percentage: float = 0.0
+
+
+class EmployerConcentration(BaseModel):
+    """What share of alumni WITH A KNOWN COMPANY work at the largest
+    employers - i.e. denominator is `alumni_with_company`, not the full
+    active dataset."""
+
+    top_5_company_share: float = 0.0
+    top_15_company_share: float = 0.0
+
+
+class CompanyGroup(BaseModel):
+    industry: str
+    companies: list[NamedCount] = []
+
+
+class SeniorityIndustryCount(BaseModel):
+    industry: str
+    seniority: str
+    count: int
+
+
 class AnalyticsSummary(BaseModel):
     organization: str
     dataset: DatasetInfo
@@ -81,6 +114,12 @@ class AnalyticsSummary(BaseModel):
     cities: list[CityCount] = []
     states: list[StateCount] = []
     data_quality: DataQuality
+
+    # --- Combined Companies + Industries page ---
+    company_industry_overview: CompanyIndustryOverview = Field(default_factory=CompanyIndustryOverview)
+    employer_concentration: EmployerConcentration = Field(default_factory=EmployerConcentration)
+    top_companies_by_industry: list[CompanyGroup] = []
+    seniority_by_industry: list[SeniorityIndustryCount] = []
 
     # --- Legacy fields, kept for backward compatibility with earlier
     # frontend builds. New consumers should use the fields above. ---

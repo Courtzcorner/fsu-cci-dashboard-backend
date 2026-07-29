@@ -27,13 +27,17 @@ from app.models.organization import Organization
 from app.schemas.analytics import (
     AnalyticsSummary,
     CityCount,
+    CompanyGroup,
+    CompanyIndustryOverview,
     DataQuality,
     DatasetInfo,
+    EmployerConcentration,
     LocationCount,
     LocationNormalizationCoverage,
     LocationsSummary,
     MetroAreaCount,
     NamedCount,
+    SeniorityIndustryCount,
     StateCount,
     Totals,
 )
@@ -47,6 +51,15 @@ router = APIRouter(tags=["analytics"])
 
 TOP_N_DEFAULT = 10
 TOP_N_WIDE = 25
+# Combined Companies + Industries page.
+TOP_COMPANIES_LIMIT = 15
+TOP_INDUSTRIES_FOR_BREAKDOWN = 8
+TOP_COMPANIES_PER_INDUSTRY = 5
+# Safety cap only - the number of distinct (industry, seniority) pairs is
+# inherently small and bounded regardless of active dataset size, but a
+# LIMIT keeps this deterministic and defensive against a future industry
+# taxonomy blowing up in size.
+SENIORITY_BY_INDUSTRY_LIMIT = 200
 
 
 def _active_filter(organization_id: str):
@@ -95,6 +108,65 @@ def _distinct_count(db: Session, organization_id: str, column, profile_alias) ->
         profile_alias,
     )
     return query.filter(*_active_filter(organization_id), column.isnot(None)).scalar() or 0
+
+
+def _top_companies_by_industry(db: Session, organization_id: str, eff, profile_alias) -> list[CompanyGroup]:
+    """One aggregated GROUP BY (industry, company) query - bounded by the
+    number of distinct (industry, company) pairs in the active dataset,
+    never by alumni row count - then the "largest industries first" /
+    "top N companies per industry" trimming happens in Python over that
+    already-small, already-sorted result set (never over raw alumni
+    rows). `eff.industry` only ever holds an imported or
+    admin-verified-company-mapping value (see
+    app.services.classification_service.resolve_industry) - never a
+    keyword guess from the company name - so no extra filtering is
+    needed here to satisfy "verified or imported industry values only".
+    """
+    rows = (
+        _with_profile_join(
+            db.query(eff.industry, eff.company, func.count(Alumni.id))
+            .select_from(Alumni)
+            .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id),
+            profile_alias,
+        )
+        .filter(*_active_filter(organization_id), eff.industry.isnot(None), eff.company.isnot(None))
+        .group_by(eff.industry, eff.company)
+        .order_by(eff.industry.asc(), func.count(Alumni.id).desc(), eff.company.asc())
+        .all()
+    )
+
+    companies_by_industry: dict[str, list[NamedCount]] = {}
+    totals_by_industry: dict[str, int] = {}
+    for industry, company, count in rows:
+        companies_by_industry.setdefault(industry, []).append(NamedCount(name=company, count=count))
+        totals_by_industry[industry] = totals_by_industry.get(industry, 0) + count
+
+    largest_industries_first = sorted(totals_by_industry, key=lambda name: (-totals_by_industry[name], name))
+    return [
+        CompanyGroup(industry=industry, companies=companies_by_industry[industry][:TOP_COMPANIES_PER_INDUSTRY])
+        for industry in largest_industries_first[:TOP_INDUSTRIES_FOR_BREAKDOWN]
+    ]
+
+
+def _seniority_by_industry(db: Session, organization_id: str, eff, profile_alias) -> list[SeniorityIndustryCount]:
+    """One aggregated GROUP BY (industry, seniority) query. `eff.seniority`
+    is always one of the existing deterministic title-rule/imported
+    values (see app.services.classification_service) - nothing new is
+    guessed here."""
+    rows = (
+        _with_profile_join(
+            db.query(eff.industry, eff.seniority, func.count(Alumni.id))
+            .select_from(Alumni)
+            .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id),
+            profile_alias,
+        )
+        .filter(*_active_filter(organization_id), eff.industry.isnot(None), eff.seniority.isnot(None))
+        .group_by(eff.industry, eff.seniority)
+        .order_by(eff.industry.asc(), func.count(Alumni.id).desc(), eff.seniority.asc())
+        .limit(SENIORITY_BY_INDUSTRY_LIMIT)
+        .all()
+    )
+    return [SeniorityIndustryCount(industry=industry, seniority=seniority, count=count) for industry, seniority, count in rows]
 
 
 def _latest_csv_import(db: Session, organization_id: str) -> Optional[CSVImport]:
@@ -148,10 +220,45 @@ def get_analytics_summary(
         unclassified_seniority=_count_where(db, org_id, profile_alias, eff.seniority.is_(None)),
     )
 
+    # --- Combined Companies + Industries page ---
+    unique_companies = _distinct_count(db, org_id, eff.company, profile_alias)
+    classified_industries = _distinct_count(db, org_id, eff.industry, profile_alias)
+    alumni_with_company = data_quality.with_company
+    alumni_with_industry = _count_where(db, org_id, profile_alias, eff.industry.isnot(None))
+    company_industry_overview = CompanyIndustryOverview(
+        unique_companies=unique_companies,
+        classified_industries=classified_industries,
+        alumni_with_company=alumni_with_company,
+        alumni_with_industry=alumni_with_industry,
+        company_coverage_percentage=(
+            round((alumni_with_company / total_alumni) * 100, 1) if total_alumni else 0.0
+        ),
+        industry_coverage_percentage=(
+            round((alumni_with_industry / total_alumni) * 100, 1) if total_alumni else 0.0
+        ),
+    )
+
     top_companies = [
         NamedCount(name=name, count=count)
-        for name, count in _grouped_counts(db, org_id, eff.company, profile_alias, TOP_N_DEFAULT)
+        for name, count in _grouped_counts(db, org_id, eff.company, profile_alias, TOP_COMPANIES_LIMIT)
     ]
+
+    # Denominator is alumni WITH A KNOWN COMPANY, per spec - never the
+    # full active dataset - so this reflects concentration among alumni
+    # whose employer is actually known, not diluted by missing data.
+    top_5_sum = sum(c.count for c in top_companies[:5])
+    top_15_sum = sum(c.count for c in top_companies[:TOP_COMPANIES_LIMIT])
+    employer_concentration = EmployerConcentration(
+        top_5_company_share=(
+            round((top_5_sum / alumni_with_company) * 100, 1) if alumni_with_company else 0.0
+        ),
+        top_15_company_share=(
+            round((top_15_sum / alumni_with_company) * 100, 1) if alumni_with_company else 0.0
+        ),
+    )
+
+    top_companies_by_industry = _top_companies_by_industry(db, org_id, eff, profile_alias)
+    seniority_by_industry = _seniority_by_industry(db, org_id, eff, profile_alias)
     industries = [
         NamedCount(name=name, count=count)
         for name, count in _grouped_counts(db, org_id, eff.industry, profile_alias, TOP_N_DEFAULT)
@@ -230,6 +337,10 @@ def get_analytics_summary(
         cities=cities,
         states=states,
         data_quality=data_quality,
+        company_industry_overview=company_industry_overview,
+        employer_concentration=employer_concentration,
+        top_companies_by_industry=top_companies_by_industry,
+        seniority_by_industry=seniority_by_industry,
         # legacy
         total_alumni=total_alumni,
         verified_alumni=verified_alumni,

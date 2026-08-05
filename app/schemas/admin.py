@@ -28,6 +28,10 @@ class RowError(BaseModel):
 
 class ImportResult(BaseModel):
     organization: str
+    # Phase 2 addition (optional, additive, backward compatible) - the
+    # human-readable Organization.name for the same org as `organization`
+    # (the slug). Never an internal database ID.
+    organization_display_name: str | None = None
     filename: str | None = None
     created: int
     updated: int
@@ -123,6 +127,11 @@ class CurrentImportOut(BaseModel):
     import for the (single, default) organization."""
 
     import_logic_version: str = "replace-v2"
+    # Phase 2 addition (optional, additive, backward compatible) - the
+    # organization this status describes: its slug and human-readable
+    # Organization.name. Never an internal database ID.
+    organization: str | None = None
+    organization_display_name: str | None = None
     csv_import_id: str | None = None
     filename: str | None = None
     uploaded_at: str | None = None

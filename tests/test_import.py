@@ -8,12 +8,17 @@ def _login(client, username, password):
     return client.post("/login", json={"username": username, "password": password}).json()["access_token"]
 
 
-def _upload(client, token, csv_text):
-    """POST /admin/import-alumni no longer accepts (or requires) an
-    organization field at all - there is only one dashboard/dataset, and
-    the admin cannot select or specify an organization."""
+def _upload(client, token, csv_text, organization=None):
+    """POST /admin/import-alumni no longer requires an organization form
+    field (there is no such field - it was never a Form/multipart field).
+    Phase 2 added an OPTIONAL `?organization=<slug>` query parameter that
+    falls back to DEFAULT_ORGANIZATION_SLUG when omitted - `organization`
+    defaults to None here so every pre-existing call site keeps testing
+    the exact default-organization behavior unchanged."""
+    params = {"organization": organization} if organization is not None else None
     return client.post(
         "/admin/import-alumni",
+        params=params,
         files={"file": ("alumni.csv", io.BytesIO(csv_text.encode("utf-8")), "text/csv")},
         headers={"Authorization": f"Bearer {token}"},
     )

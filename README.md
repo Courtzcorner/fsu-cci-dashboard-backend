@@ -297,19 +297,38 @@ All three accept `?organization=<slug>` (defaults to `DEFAULT_ORGANIZATION_SLUG`
 
 ### Admin
 
-- `POST /admin/import-alumni` - `file` (CSV) only; no `organization` field.
-  Replace-mode import - see "Replace mode" and "CSV import accounting"
-  above for the full response shape.
-- `GET /admin/current-import` - metadata for the single dataset currently
-  powering the dashboard (the most recently *successful* CSV import): id,
-  filename, upload timestamp, raw row-accounting persisted from that
-  import (`rows_received`/`rows_valid`/`rows_invalid`), and the live,
-  re-queried `active_database_total`. Returns `status: "none"` if no CSV
-  has ever been imported successfully. Any authenticated role (admin or
-  alumni) may call this, mirroring read access to `/alumni-data`.
-- `GET /admin/export-alumni` - streams the active dataset as a CSV
-  download (imported columns, derived industry/career/seniority + their
-  provenance, and effective-data overrides); admin only.
+`POST /admin/import-alumni`, `GET /admin/current-import`, and
+`GET /admin/export-alumni` all accept an optional `?organization=<slug>`
+query parameter. Omitting it preserves the exact previous behavior:
+resolving to the configured `DEFAULT_ORGANIZATION_SLUG`. All three require
+an *effective admin role for the requested organization* - not merely a
+globally-admin account - resolved via the same organization-membership
+authorization used elsewhere (see `get_authorized_organization`); an
+account with no `UserOrganization` memberships at all keeps today's
+unrestricted (legacy) admin access as a temporary rollout compatibility
+fallback. Requesting an organization the caller isn't a member of returns
+`403`; an unknown organization slug returns `404`.
+
+- `POST /admin/import-alumni?organization=<slug>` - `file` (CSV) only.
+  Replace-mode import, scoped to (and replacing only) the requested
+  organization's active dataset - see "Replace mode" and "CSV import
+  accounting" above for the full response shape. The response's
+  `organization` (slug) and `organization_display_name` fields identify
+  which organization the import applied to.
+- `GET /admin/current-import?organization=<slug>` - metadata for the
+  requested organization's dataset (the most recently *successful* CSV
+  import for it): id, filename, upload timestamp, raw row-accounting
+  persisted from that import (`rows_received`/`rows_valid`/
+  `rows_invalid`), the live, re-queried `active_database_total`, and the
+  `organization`/`organization_display_name` the status describes.
+  Returns `status: "none"` if no CSV has ever been imported successfully
+  for that organization - it never falls back to another organization's
+  history. Admin only (an alumni account receives `403`).
+- `GET /admin/export-alumni?organization=<slug>` - streams the requested
+  organization's active dataset as a CSV download (imported columns,
+  derived industry/career/seniority + their provenance, and
+  effective-data overrides); admin only. The download filename remains
+  `alumni_export.csv` for every organization in this phase.
 - `POST /admin/normalize-locations`
 - `GET /admin/legal-name-requests`, `POST /admin/legal-name-requests/{id}/approve|reject`
 

@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.organization import Organization
-from app.models.roles import resolve_effective_role
+from app.models.roles import UserRole, resolve_effective_role
 from app.models.user import User
 from app.models.user_organization import UserOrganization
 from app.security import TokenError, decode_access_token
@@ -212,6 +212,23 @@ def get_authorized_organization(
 def require_admin_role(current_user: CurrentUser) -> None:
     if not current_user.is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
+
+
+def require_admin_role_for(organization_access: OrganizationAccess) -> None:
+    """Organization-scoped admin check (Phase 2): unlike require_admin_role
+    above (which only ever looks at the account's global users.role), this
+    checks the EFFECTIVE role already resolved for the specific
+    organization in `organization_access` (see get_authorized_organization) -
+    i.e. a per-organization membership role if one exists, otherwise the
+    legacy-fallback global role. Always fails closed: effective_role has
+    already been validated against SUPPORTED_USER_ROLES by
+    get_authorized_organization, so this is a plain equality check, never
+    a guess."""
+    if organization_access.effective_role != UserRole.ADMIN.value:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required for this organization",
+        )
 
 
 def require_alumni_profile(current_user: CurrentUser) -> str:

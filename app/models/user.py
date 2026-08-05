@@ -50,6 +50,11 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     alumni = relationship("Alumni", back_populates="user_account")
+    # Phase 1 infrastructure only (see app.models.user_organization) - no
+    # rows exist yet, and no existing endpoint reads this relationship.
+    organization_links = relationship(
+        "UserOrganization", back_populates="user", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"<User username={self.username!r} role={self.role!r}>"

@@ -15,6 +15,20 @@ ORGANIZATIONS_SEED_DATA = [
     {"name": "STARS National", "slug": "stars-national"},
 ]
 
+# Phase 1 multi-institution context metadata (see app.models.organization
+# context_type/theme_key). Keyed by slug so seed_organizations() below can
+# apply it idempotently to ONLY these three known, already-seeded
+# organizations - never renaming/merging/deleting anything, and never
+# touching `name`/`slug` for an already-existing row. `fsu-cci` keeps a
+# null theme_key: it is a legacy organization whose production data
+# ownership has not yet been confirmed (see architecture analysis), so no
+# frontend theme is assigned to it in this phase.
+ORGANIZATION_CONTEXT_METADATA = {
+    "stars-national": {"context_type": "national", "theme_key": "stars-national"},
+    "fsu-stars": {"context_type": "institution", "theme_key": "stars-fsu"},
+    "fsu-cci": {"context_type": "institution", "theme_key": None},
+}
+
 
 def seed_organizations(db: Session) -> list[Organization]:
     created_or_existing: list[Organization] = []
@@ -23,6 +37,13 @@ def seed_organizations(db: Session) -> list[Organization]:
         if organization is None:
             organization = Organization(name=entry["name"], slug=entry["slug"])
             db.add(organization)
+
+        metadata = ORGANIZATION_CONTEXT_METADATA.get(entry["slug"])
+        if metadata is not None:
+            organization.context_type = metadata["context_type"]
+            if metadata["theme_key"] is not None:
+                organization.theme_key = metadata["theme_key"]
+
         created_or_existing.append(organization)
     db.commit()
     return created_or_existing

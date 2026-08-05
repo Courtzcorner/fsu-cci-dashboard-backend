@@ -18,6 +18,16 @@ matches today's actual behavior (any authenticated user can already pass
 endpoint). Once real UserOrganization rows exist for an account, that
 account is restricted to exactly its memberships and this fallback no
 longer applies to it.
+
+TEMPORARY ALUMNI COMPATIBILITY (separate from, and layered on top of, the
+legacy fallback above - see app.services.temporary_alumni_context_policy
+for the full rationale and removal plan): regardless of an alumni
+account's UserOrganization rows (none, or some that don't include them),
+`stars-national` and `fsu-stars` are always included for it, with
+`has_active_dataset` reported truthfully rather than being hidden by the
+"institution with no active dataset" rule below. This is intentionally
+narrow (exactly those two slugs, exactly effective-global-role "alumni")
+and never elevates role or grants import/admin capability.
 """
 from sqlalchemy.orm import Session
 
@@ -27,6 +37,10 @@ from app.models.organization import Organization
 from app.models.roles import UserRole, resolve_effective_role
 from app.models.user_organization import UserOrganization
 from app.schemas.organization import AvailableContextOut
+from app.services.temporary_alumni_context_policy import (
+    TEMPORARY_ALUMNI_COMPATIBLE_SLUGS,
+    is_temporary_alumni_compatibility_slug,
+)
 
 
 def organization_has_active_dataset(db: Session, organization_id: str) -> bool:
@@ -105,4 +119,53 @@ def build_available_contexts(db: Session, current_user: CurrentUser) -> list[Ava
             )
         )
 
+    results.extend(_temporary_alumni_compatibility_contexts(db, current_user, already_included_slugs=results))
+
+    # Deterministic ordering: candidates are gathered from an unordered
+    # membership query (or an unordered "all organizations" query for the
+    # legacy fallback) and TEMPORARY_ALUMNI_COMPATIBLE_SLUGS is a
+    # frozenset (iteration order isn't guaranteed stable across Python
+    # process restarts) - neither is a reliable response order on its
+    # own. Sort purely for stable, predictable presentation: national
+    # contexts first, then alphabetically by display name. This never
+    # affects which contexts are included or any role/authorization
+    # field - only their order in the list.
+    results.sort(key=lambda context: (context.context_type != "national", context.display_name))
+
     return results
+
+
+def _temporary_alumni_compatibility_contexts(
+    db: Session, current_user: CurrentUser, already_included_slugs: list[AvailableContextOut]
+) -> list[AvailableContextOut]:
+    """See app.services.temporary_alumni_context_policy. Appends
+    `stars-national` and `fsu-stars` for an effective-global-role "alumni"
+    account, skipping any slug already present (a real membership or the
+    legacy fallback already produced a - possibly different - role/
+    has_active_dataset for it, which must win) and skipping any slug
+    whose Organization row doesn't exist in this environment (never
+    invents one).
+    """
+    effective_global_role = resolve_effective_role(None, current_user.role)
+    seen_slugs = {context.slug for context in already_included_slugs}
+    additions: list[AvailableContextOut] = []
+
+    for slug in TEMPORARY_ALUMNI_COMPATIBLE_SLUGS:
+        if slug in seen_slugs or not is_temporary_alumni_compatibility_slug(slug, effective_global_role):
+            continue
+        organization = db.query(Organization).filter(Organization.slug == slug).first()
+        if organization is None:
+            continue
+        additions.append(
+            AvailableContextOut(
+                slug=organization.slug,
+                display_name=organization.name,
+                context_type=organization.context_type,
+                role=UserRole.ALUMNI.value,
+                has_active_dataset=organization_has_active_dataset(db, organization.id),
+                can_import=False,
+                theme_key=organization.theme_key,
+            )
+        )
+
+    return additions

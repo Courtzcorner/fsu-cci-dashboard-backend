@@ -2,8 +2,16 @@
 
 The most recently uploaded CSV must become the complete, exclusive,
 authoritative alumni dataset: GET /alumni-data, GET /analytics/summary,
-and the active-alumni count must all agree, and none of these endpoints
-require (or accept) an organization parameter from the frontend.
+and the active-alumni count must all agree. GET /alumni-data and
+GET /analytics/summary never require an organization parameter.
+
+POST /admin/import-alumni, GET /admin/current-import, and
+GET /admin/export-alumni accept an OPTIONAL `?organization=<slug>` query
+parameter (Phase 2) that falls back to DEFAULT_ORGANIZATION_SLUG when
+omitted - the tests below that don't pass one are specifically verifying
+that default-fallback behavior is unchanged. Cross-organization isolation
+for these three admin endpoints is covered in
+tests/test_organization_scoped_admin.py.
 """
 import io
 

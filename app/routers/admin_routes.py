@@ -10,9 +10,15 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-from app.config import get_settings
 from app.database import get_db
-from app.deps import CurrentUser, get_current_user, require_admin_role
+from app.deps import (
+    CurrentUser,
+    OrganizationAccess,
+    get_authorized_organization,
+    get_current_user,
+    require_admin_role,
+    require_admin_role_for,
+)
 from app.models.alumni import Alumni, AlumniOrganization
 from app.models.audit import CSVImport
 from app.models.legal_name import LegalNameChangeRequest
@@ -57,15 +63,6 @@ def _resolve_organization(db: Session, slug: str) -> Organization:
     return organization
 
 
-def _get_default_organization(db: Session) -> Organization:
-    """The product exposes a single dashboard/dataset: the admin never
-    selects or submits an organization. Internally this still resolves to
-    the configured default organization slug (kept for architectural
-    compatibility), but that value is never taken from client input.
-    """
-    return _resolve_organization(db, get_settings().default_organization_slug)
-
-
 @router.get("/users", response_model=list[UserAdminOut])
 def list_users(
     current_user: CurrentUser = Depends(get_current_user),
@@ -96,6 +93,7 @@ def list_users(
 @router.post("/import-alumni", response_model=ImportResult)
 async def import_alumni(
     file: UploadFile = File(...),
+    organization_access: OrganizationAccess = Depends(get_authorized_organization),
     current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ImportResult:
@@ -108,12 +106,29 @@ async def import_alumni(
 
     There is no legacy merge/upsert import function wired to this route:
     every successful import replaces the organization's active dataset.
+
+    Phase 2: the target organization is resolved (and authorized) via
+    `?organization=<slug>` - falling back to DEFAULT_ORGANIZATION_SLUG
+    exactly as before when omitted - through get_authorized_organization,
+    and the caller must be an effective admin FOR THAT ORGANIZATION (see
+    require_admin_role_for), not just globally. import_alumni_csv itself
+    is unchanged and was already fully organization-scoped (see its
+    docstring / app.services.csv_import_service) - only the organization
+    it's called with is now request-driven instead of hardcoded.
+
+    NOTE (shared Alumni.is_active limitation - do not redesign here):
+    Alumni.is_active is currently global to an Alumni row rather than
+    scoped to an AlumniOrganization link. Import isolation between
+    organizations is safe today only because an import-created Alumni row
+    is linked to exactly one organization (see
+    app.services.csv_import_service._build_alumni_match_index, which only
+    ever matches within the target organization's existing links).
+    Deliberately linking the same Alumni row to more than one organization
+    (e.g. a future alumni/org-link backfill or shared-record feature) must
+    revisit this before it can be done safely.
     """
-    # There is only one dashboard/dataset: the admin does not - and cannot -
-    # choose an organization. This always imports into (and replaces) the
-    # backend's single configured default organization's dataset.
-    require_admin_role(current_user)
-    organization_record = _get_default_organization(db)
+    require_admin_role_for(organization_access)
+    organization_record = organization_access.organization
 
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .csv files are accepted")
@@ -139,6 +154,7 @@ async def import_alumni(
 
     return ImportResult(
         organization=organization_record.slug,
+        organization_display_name=organization_record.name,
         filename=summary.filename,
         created=summary.created,
         updated=summary.updated,
@@ -201,18 +217,25 @@ async def import_alumni(
 
 @router.get("/current-import", response_model=CurrentImportOut)
 def get_current_import(
-    current_user: CurrentUser = Depends(get_current_user),
+    organization_access: OrganizationAccess = Depends(get_authorized_organization),
     db: Session = Depends(get_db),
 ) -> CurrentImportOut:
-    """Metadata for the single dataset currently powering the dashboard -
-    the latest successfully committed CSV import. Only successful imports
+    """Metadata for the requested organization's dataset - the latest
+    successfully committed CSV import for it. Only successful imports
     ever write a CSVImport row, so "most recent by created_at" is always
     "most recent successful" - a failed import never appears here and
-    never changes what this endpoint reports. Any authenticated user
-    (admin or alumni) may check this, mirroring read access to
-    /alumni-data.
+    never changes what this endpoint reports.
+
+    Phase 2: this endpoint is now under the `/admin` namespace's
+    organization-scoped admin check (require_admin_role_for) - it exposes
+    internal import filenames, timestamps, row accounting, and dataset
+    status, so alumni access (previously allowed) is intentionally closed
+    here. It never falls back to another organization's history: an
+    organization with zero imports returns status="none" for ITSELF, not
+    another organization's data.
     """
-    organization_record = _get_default_organization(db)
+    require_admin_role_for(organization_access)
+    organization_record = organization_access.organization
 
     active_total = (
         db.query(Alumni)
@@ -230,6 +253,8 @@ def get_current_import(
     if latest_import is None:
         return CurrentImportOut(
             import_logic_version=IMPORT_LOGIC_VERSION,
+            organization=organization_record.slug,
+            organization_display_name=organization_record.name,
             active_database_total=active_total,
             status="none",
         )
@@ -237,6 +262,8 @@ def get_current_import(
     imported_at = latest_import.created_at.isoformat() if latest_import.created_at else None
     return CurrentImportOut(
         import_logic_version=IMPORT_LOGIC_VERSION,
+        organization=organization_record.slug,
+        organization_display_name=organization_record.name,
         csv_import_id=latest_import.id,
         filename=latest_import.filename,
         uploaded_at=imported_at,
@@ -316,22 +343,28 @@ def _export_row(alumni: Alumni, profile: UserProfile | None) -> list:
 
 @router.get("/export-alumni")
 def export_alumni(
-    current_user: CurrentUser = Depends(get_current_user),
+    organization_access: OrganizationAccess = Depends(get_authorized_organization),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
-    """Streams the current active dataset (imported CSV columns plus
-    every backend-derived column and its provenance) as a CSV download.
-    Never overwrites imported source values - `industry`/`career_category`/
-    `seniority` here are exactly what's stored on each Alumni row, and each
-    has its own `*_source` column (imported / derived:title_rules /
-    company_mapping / unknown) alongside it.
+    """Streams the requested organization's active dataset (imported CSV
+    columns plus every backend-derived column and its provenance) as a CSV
+    download. Never overwrites imported source values - `industry`/
+    `career_category`/`seniority` here are exactly what's stored on each
+    Alumni row, and each has its own `*_source` column (imported /
+    derived:title_rules / company_mapping / unknown) alongside it.
 
     Rows are fetched in keyset-paginated batches (ordered by id, not
     OFFSET) so a 75,000-row export never materializes the full dataset in
-    memory at once.
+    memory at once. Never includes another organization's rows - the
+    underlying query is scoped by AlumniOrganization.organization_id (see
+    _active_alumni_export_query).
+
+    Phase 2: filename intentionally stays `alumni_export.csv` for every
+    organization in this phase (a context-specific filename is a
+    frontend-facing UX change to be reviewed independently later).
     """
-    require_admin_role(current_user)
-    organization_record = _get_default_organization(db)
+    require_admin_role_for(organization_access)
+    organization_record = organization_access.organization
     base_query = _active_alumni_export_query(db, organization_record.id)
 
     def generate():

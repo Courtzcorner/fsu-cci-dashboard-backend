@@ -524,6 +524,53 @@ def test_csv_missing_optional_columns_still_imports_successfully(client, organiz
     assert directory.json()["meta"]["total"] == 2
 
 
+# --- Regression: production "Stars" header set caused zero valid rows ---
+#
+# The uploaded CSV used FNAME/LNAME (not First Name/Last Name), which were
+# not recognized as aliases for first_name/last_name. Since no full_name
+# column existed either, every row failed "Missing required field(s)" and
+# the import aborted with zero valid rows out of 2,220 parsed. STATUS,
+# Stars CODE, AKA, Alt University, and "other links" have no Alumni column
+# and are intentionally left unrecognized/ignored - they must never cause
+# a row (or the whole import) to fail.
+CSV_STARS_HEADERS = (
+    "STATUS,Stars CODE,FNAME,LNAME,AKA,School,Alt University,Email,other links,"
+    "LINKEDIN,Title,Employer,City,State,Notes\n"
+    "Active,SC-1001,Jordan,Lee,JLee,Florida State University,,jordan.lee@example.com,,"
+    "linkedin.com/in/jordanlee,Product Manager,Capital One,Brooklyn,NY,Great mentor\n"
+)
+
+
+def test_csv_import_recognizes_fname_lname_headers(client, organization, admin_user, db_session):
+    """Regression for the exact production header row that produced zero
+    valid rows: FNAME/LNAME must map to first_name/last_name so rows are
+    no longer universally rejected as missing required fields, while
+    STATUS/Stars CODE/AKA/Alt University/other links remain tolerated as
+    unrecognized (ignored, never a failure)."""
+    token = _login(client, "admin", "AdminPass123!")
+    response = _upload(client, token, CSV_STARS_HEADERS)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["created"] == 1
+    assert body["failed"] == 0
+    assert body["active_database_total"] == 1
+
+    unrecognized_lower = {h.lower() for h in body["unrecognized_headers"]}
+    assert "fname" not in unrecognized_lower
+    assert "lname" not in unrecognized_lower
+    # These have no Alumni column and are expected to remain unrecognized -
+    # tolerated, never a cause of row/import failure.
+    assert {"status", "stars code", "aka", "alt university", "other links"} <= unrecognized_lower
+
+    record = db_session.query(Alumni).filter(Alumni.first_name == "Jordan").one()
+    assert record.last_name == "Lee"
+    assert record.university == "Florida State University"
+    assert record.company == "Capital One"
+    assert record.city == "Brooklyn"
+    assert record.state == "New York"
+    assert record.notes == "Great mentor"
+
+
 def test_reimport_fills_previously_null_city_state_and_location(client, organization, admin_user, db_session):
     """An existing record imported before city/state support existed (so
     city/state/location_original are null) must get backfilled by a

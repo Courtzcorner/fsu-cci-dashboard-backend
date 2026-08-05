@@ -1,3 +1,4 @@
+import csv
 import io
 
 from app.models.alumni import Alumni, AlumniOrganization
@@ -443,6 +444,84 @@ def test_csv_import_uses_separate_city_state_columns_and_classifies_education_as
     assert record.location_original == "Indianapolis, IN"
     assert record.display_location == "Indianapolis, IN"
     assert record.location_normalization_status != "missing"
+
+
+def test_csv_import_persists_notes_in_the_database(client, organization, admin_user, db_session):
+    """The CSV's free-text "Notes" column must be carried through to
+    alumni.notes in the database."""
+    token = _login(client, "admin", "AdminPass123!")
+    csv_text = (
+        "First Name,Last Name,Notes\n"
+        "Jamie,Fox,\"Great mentor, always responsive\"\n"
+    )
+    response = _upload(client, token, csv_text)
+    assert response.status_code == 200, response.text
+    assert response.json()["created"] == 1
+
+    record = db_session.query(Alumni).filter(Alumni.first_name == "Jamie").one()
+    assert record.notes == "Great mentor, always responsive"
+
+
+def test_csv_import_notes_appear_in_admin_export(client, organization, admin_user, db_session):
+    """Imported notes must be present in the admin CSV export - this is
+    the only endpoint that surfaces alumni.notes."""
+    token = _login(client, "admin", "AdminPass123!")
+    csv_text = (
+        "First Name,Last Name,Notes\n"
+        "Jamie,Fox,\"Great mentor, always responsive\"\n"
+    )
+    _upload(client, token, csv_text)
+
+    export = client.get("/admin/export-alumni", headers={"Authorization": f"Bearer {token}"})
+    assert export.status_code == 200
+    rows = list(csv.DictReader(io.StringIO(export.text)))
+    assert len(rows) == 1
+    assert rows[0]["Notes"] == "Great mentor, always responsive"
+
+
+def test_csv_import_notes_are_not_exposed_by_alumni_data_api(client, organization, admin_user, db_session):
+    """alumni.notes must never be returned by GET /alumni-data - it is
+    only ever surfaced through the admin CSV export."""
+    token = _login(client, "admin", "AdminPass123!")
+    csv_text = (
+        "First Name,Last Name,Notes\n"
+        "Jamie,Fox,\"Great mentor, always responsive\"\n"
+    )
+    _upload(client, token, csv_text)
+
+    directory = client.get("/alumni-data", headers={"Authorization": f"Bearer {token}"})
+    assert directory.status_code == 200
+    data = directory.json()["data"]
+    assert len(data) == 1
+    assert "notes" not in data[0]
+
+
+def test_csv_missing_optional_columns_still_imports_successfully(client, organization, admin_user, db_session):
+    """A CSV lacking every optional column (Notes, Industry, City, State,
+    Education) - only First Name/Last Name present - must still import
+    cleanly with those genuinely-omitted fields simply left null, never
+    failing the row."""
+    token = _login(client, "admin", "AdminPass123!")
+    csv_text = "First Name,Last Name\nAlex,Rivera\nSam,Patel\n"
+    response = _upload(client, token, csv_text)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["created"] == 2
+    assert body["failed"] == 0
+    assert body["active_database_total"] == 2
+
+    records = db_session.query(Alumni).filter(Alumni.first_name.in_(["Alex", "Sam"])).all()
+    assert len(records) == 2
+    for record in records:
+        assert record.notes is None
+        assert record.industry is None
+        assert record.city is None
+        assert record.state is None
+        assert record.degree is None
+
+    directory = client.get("/alumni-data", headers={"Authorization": f"Bearer {token}"})
+    assert directory.status_code == 200
+    assert directory.json()["meta"]["total"] == 2
 
 
 def test_reimport_fills_previously_null_city_state_and_location(client, organization, admin_user, db_session):

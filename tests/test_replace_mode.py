@@ -235,6 +235,7 @@ def test_250_physical_line_csv_with_header_produces_249_active_alumni(
     assert record.display_location == "Indianapolis, IN"
     assert record.university == "Florida State University"
     assert record.email == "first0.last0@example.com"
+    assert record.notes == "Some note"
     assert record.verification_status == "Updated"
     assert record.verification_date is not None
     assert record.verification_date.isoformat() == "2026-06-15"

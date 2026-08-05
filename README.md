@@ -174,18 +174,81 @@ Atlanta metro, etc.).
 python scripts/create_user.py --username admin --role admin
 ```
 
-### 1.8 Import FSU CCI alumni
+### 1.8 Import alumni
 
 ```bash
 curl -X POST http://localhost:8000/admin/import-alumni \
   -H "Authorization: Bearer <your_token>" \
-  -F "organization=fsu-cci" \
-  -F "file=@/path/to/fsu_cci_alumni.csv"
+  -F "file=@/path/to/alumni.csv"
 ```
 
 Or use the interactive docs at `/docs` to upload the file from a browser.
-Every import is recorded in `csv_imports` (created/updated/skipped/failed
-counts + row errors) and logged in `audit_logs`.
+`POST /admin/import-alumni` no longer accepts (or requires) an
+`organization` form field - there is only one dashboard/dataset, and every
+successful import always replaces that single organization's active
+dataset (see "Replace mode" below). Every import is recorded in
+`csv_imports` (created/updated/skipped/failed counts + row errors) and
+logged in `audit_logs`.
+
+#### Replace mode
+
+Every successful CSV upload becomes the complete, exclusive, authoritative
+alumni dataset - not a merge or upsert on top of whatever was imported
+before:
+
+- Rows matched (by normalized LinkedIn URL, then normalized email, then
+  first+last name, in that priority order) to an existing alumni record
+  are updated in place; genuinely new rows are created.
+- Any alumni previously active but **not** present in the newest upload is
+  **deactivated** (`is_active = False`) - never physically deleted. Its
+  history remains queryable in the database, but it is excluded from
+  `GET /alumni-data`, `GET /analytics/summary`, and the admin export.
+- If an import fails (e.g. it produces zero valid rows, or the commit
+  itself fails), the entire transaction is rolled back and the previous
+  active dataset is left completely unchanged - a failed import is never
+  reported as a success and never partially applies.
+- The import response's `active_database_total` is always the true,
+  re-queried count of active alumni after the import - the single number
+  the dashboard and analytics must match exactly.
+  `historical_database_total` additionally includes deactivated
+  (archived) rows and should never be used as the dashboard total.
+
+#### CSV import accounting
+
+Every import response reports raw file accounting independent of how many
+rows parsed cleanly, so a mismatch between "rows in the file" and "rows
+imported" is always visible without a debugger:
+
+- `csv_physical_lines` - every line in the raw uploaded file, including
+  the header (a single trailing blank line from the file ending in a
+  newline is not counted).
+- `csv_header_rows` - `1` for a well-formed CSV.
+- `csv_data_rows` - `csv_physical_lines - csv_header_rows`.
+- `csv_valid_rows` / `csv_invalid_rows` (aliases: `csv_rows_valid` /
+  `csv_rows_invalid`, `rows_valid` / `rows_invalid`) - how many data rows
+  parsed into a valid alumni record vs. failed validation.
+- `csv_duplicate_rows` (alias: `duplicate_rows`) - rows within the same
+  upload that matched an already-processed row in this same import.
+- `created` / `updated` / `unchanged` / `deactivated` (alias: `archived`)
+  / `skipped` / `failed` - what happened to each matched/unmatched alumni
+  record.
+- `recognized_headers` / `unrecognized_headers` - which uploaded column
+  headers mapped to a known field vs. were ignored, useful for diagnosing
+  a spreadsheet with unexpected column names.
+
+A 250-physical-line CSV (1 header + 249 data rows) that parses cleanly
+reports `csv_physical_lines=250`, `csv_header_rows=1`,
+`csv_data_rows=249`, `csv_valid_rows=249`, `csv_invalid_rows=0`, and
+`active_database_total=249`.
+
+#### Optional columns
+
+Only `First Name`/`Last Name` are required. Any other recognized column
+(Graduation Year, Major, Degree, University/Education, Job Title,
+Company, Industry, City, State, Location, Notes, Email, LinkedIn URL,
+Verification Status/Date, etc.) may be entirely absent from the uploaded
+CSV - the import still succeeds, and every field with no corresponding
+column simply stays `null` on the created/updated alumni record.
 
 ### 1.9 Link an alumni login to an alumni record
 
@@ -234,7 +297,19 @@ All three accept `?organization=<slug>` (defaults to `DEFAULT_ORGANIZATION_SLUG`
 
 ### Admin
 
-- `POST /admin/import-alumni` - `organization` (form field) + `file` (CSV)
+- `POST /admin/import-alumni` - `file` (CSV) only; no `organization` field.
+  Replace-mode import - see "Replace mode" and "CSV import accounting"
+  above for the full response shape.
+- `GET /admin/current-import` - metadata for the single dataset currently
+  powering the dashboard (the most recently *successful* CSV import): id,
+  filename, upload timestamp, raw row-accounting persisted from that
+  import (`rows_received`/`rows_valid`/`rows_invalid`), and the live,
+  re-queried `active_database_total`. Returns `status: "none"` if no CSV
+  has ever been imported successfully. Any authenticated role (admin or
+  alumni) may call this, mirroring read access to `/alumni-data`.
+- `GET /admin/export-alumni` - streams the active dataset as a CSV
+  download (imported columns, derived industry/career/seniority + their
+  provenance, and effective-data overrides); admin only.
 - `POST /admin/normalize-locations`
 - `GET /admin/legal-name-requests`, `POST /admin/legal-name-requests/{id}/approve|reject`
 

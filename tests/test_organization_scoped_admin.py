@@ -30,6 +30,7 @@ from app.models.organization import Organization
 from app.models.user import User
 from app.models.user_organization import UserOrganization
 from app.security import hash_password
+from app.services.temporary_alumni_context_policy import TEMPORARY_ALUMNI_COMPATIBLE_SLUGS
 from tests.conftest import ADMIN_PASSWORD, ADMIN_USERNAME, ALUMNI_PASSWORD, ALUMNI_USERNAME, login
 from tests.test_import import _upload
 
@@ -395,6 +396,39 @@ def test_failed_fsu_import_preserves_previous_fsu_and_fsu_cci_datasets(
     assert _active_alumni_count(db_session, organization) == 1
     fsu_stars_alumni = db_session.query(Alumni).filter(Alumni.first_name == "Fiona").one()
     assert fsu_stars_alumni.is_active is True
+
+
+# --------------------------------------------------------------------------
+# Temporary alumni compatibility policy must not leak into admin
+# authorization - see app.services.temporary_alumni_context_policy. An
+# effective-role-alumni account must remain 403 on all three admin
+# endpoints for BOTH stars-national and fsu-stars, exactly as for any
+# other organization.
+# --------------------------------------------------------------------------
+
+
+def test_alumni_remains_403_on_all_three_admin_endpoints_for_both_temporary_contexts(
+    client, organization, admin_user, alumni_user, db_session
+):
+    for slug in TEMPORARY_ALUMNI_COMPATIBLE_SLUGS:
+        _make_organization(db_session, slug, slug.replace("-", " ").title(), context_type="institution")
+
+    token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
+
+    for slug in TEMPORARY_ALUMNI_COMPATIBLE_SLUGS:
+        assert _upload(client, token, _csv_of([("X", "Y")]), organization=slug).status_code == 403
+        assert (
+            client.get(
+                "/admin/current-import", params={"organization": slug}, headers={"Authorization": f"Bearer {token}"}
+            ).status_code
+            == 403
+        )
+        assert (
+            client.get(
+                "/admin/export-alumni", params={"organization": slug}, headers={"Authorization": f"Bearer {token}"}
+            ).status_code
+            == 403
+        )
 
 
 # --------------------------------------------------------------------------

@@ -15,6 +15,7 @@ from app.database import get_db
 from app.models.organization import Organization
 from app.models.roles import UserRole, resolve_effective_role
 from app.models.user import User
+from app.services.temporary_alumni_context_policy import is_temporary_alumni_compatibility_slug
 from app.models.user_organization import UserOrganization
 from app.security import TokenError, decode_access_token
 
@@ -171,6 +172,15 @@ def get_authorized_organization(
       application's supported roles (see app.models.roles) and never
       silently treated as admin if unrecognized - an invalid role fails
       closed with 403.
+
+    TEMPORARY ALUMNI COMPATIBILITY (see
+    app.services.temporary_alumni_context_policy): an account whose
+    effective GLOBAL role is "alumni" is additionally granted read-context
+    access (never admin - see below) to `stars-national`/`fsu-stars` even
+    when it HAS other UserOrganization rows that don't include them. This
+    never applies to `organization`s outside those two slugs, and never
+    upgrades the granted role above "alumni" - a request for any other
+    organization the account isn't a member of is still a plain 403.
     """
     from app.config import get_settings
 
@@ -193,6 +203,18 @@ def get_authorized_organization(
         (m for m in memberships if m.organization_id == organization_record.id), None
     )
     if matching_membership is None:
+        effective_global_role = resolve_effective_role(None, current_user.role)
+        if is_temporary_alumni_compatibility_slug(slug, effective_global_role):
+            # Fails closed automatically: is_temporary_alumni_compatibility_slug
+            # only ever matches effective_global_role == "alumni" - never
+            # None (invalid role) and never "admin" - so this can never
+            # grant more than plain alumni read-context access.
+            return OrganizationAccess(
+                organization=organization_record,
+                effective_role=UserRole.ALUMNI.value,
+                membership=None,
+                is_legacy_access=False,
+            )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this organization"
         )

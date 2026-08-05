@@ -179,16 +179,21 @@ def test_legacy_admin_sees_institution_context_with_no_active_dataset(db_session
 
 
 def test_legacy_alumni_does_not_see_institution_context_with_no_active_dataset(
-    db_session, alumni_user, organization, other_organization
+    db_session, alumni_user, organization
 ):
     # `alumni_user` (via the `organization` fixture) is itself linked to
     # `organization` as an active alumni record, so use a second,
     # unrelated institution organization to test the "no active dataset
-    # at all" case in isolation.
+    # at all" case in isolation. Deliberately NOT `other_organization`
+    # (slug "stars-national") - that slug is now always visible under the
+    # temporary alumni compatibility policy (see
+    # app.services.temporary_alumni_context_policy), so it would no
+    # longer isolate this case.
+    unrelated = _make_organization(db_session, "unrelated-institution", "Unrelated Institution")
     current_user = _current_user(alumni_user)
     contexts = build_available_contexts(db_session, current_user)
 
-    assert all(c.slug != other_organization.slug for c in contexts)
+    assert all(c.slug != unrelated.slug for c in contexts)
 
 
 def test_legacy_alumni_sees_institution_context_once_it_has_an_active_dataset(db_session, alumni_user, organization):
@@ -213,7 +218,13 @@ def test_national_context_remains_visible_for_legacy_alumni_with_no_active_datas
 
 
 def test_membership_based_alumni_sees_only_matching_organizations(db_session, alumni_user, organization):
-    national = _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    # Deliberately NOT "stars-national"/"fsu-stars" - those two slugs are
+    # now always visible to an alumni account under the temporary
+    # compatibility policy (see
+    # app.services.temporary_alumni_context_policy), so a truly
+    # unrelated slug is needed to isolate "membership restricts
+    # candidates to exactly its memberships" in this test.
+    unrelated = _make_organization(db_session, "unrelated-institution", "Unrelated Institution")
     _link_active_alumni(db_session, organization)
     db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=organization.id, role="alumni"))
     db_session.commit()
@@ -223,7 +234,7 @@ def test_membership_based_alumni_sees_only_matching_organizations(db_session, al
 
     slugs = {c.slug for c in contexts}
     assert slugs == {organization.slug}
-    assert national.slug not in slugs
+    assert unrelated.slug not in slugs
 
 
 def test_national_and_fsu_membership_alumni_sees_both(db_session, alumni_user, organization):
@@ -298,7 +309,12 @@ def test_endpoint_legacy_admin_response_shape(client, admin_user, organization):
     assert contexts[organization.slug]["can_import"] is True
 
 
-def test_endpoint_legacy_alumni_response_shape(client, alumni_user, organization, other_organization):
+def test_endpoint_legacy_alumni_response_shape(client, alumni_user, organization, db_session):
+    # Deliberately a freshly created org, NOT `other_organization` (slug
+    # "stars-national") - that slug is now always visible to an alumni
+    # account under the temporary compatibility policy (see
+    # app.services.temporary_alumni_context_policy).
+    unrelated = _make_organization(db_session, "unrelated-institution", "Unrelated Institution")
     token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
     response = client.get("/organizations/available-contexts", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
@@ -311,7 +327,174 @@ def test_endpoint_legacy_alumni_response_shape(client, alumni_user, organization
     # ...but an unrelated institution context with no active dataset at
     # all is hidden from an alumni account (legacy fallback rule) - see
     # module docstring.
-    assert other_organization.slug not in contexts
+    assert unrelated.slug not in contexts
+
+
+# --------------------------------------------------------------------------
+# TEMPORARY alumni compatibility policy (stars-national / fsu-stars) - see
+# app.services.temporary_alumni_context_policy. Remove this whole section
+# (and the policy module + its two call sites) once explicit per-alumni
+# institution assignment ships.
+# --------------------------------------------------------------------------
+
+
+def test_legacy_alumni_sees_both_temporary_contexts(db_session, alumni_user):
+    _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    _make_organization(db_session, "fsu-stars", "FSU STARS", context_type="institution")
+
+    current_user = _current_user(alumni_user)
+    contexts = build_available_contexts(db_session, current_user)
+
+    slugs = {c.slug for c in contexts}
+    assert "stars-national" in slugs
+    assert "fsu-stars" in slugs
+
+
+def test_alumni_with_unrelated_explicit_membership_still_sees_both_temporary_contexts(
+    db_session, alumni_user, organization
+):
+    national = _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    fsu = _make_organization(db_session, "fsu-stars", "FSU STARS", context_type="institution")
+    # The alumni's only explicit membership is to an unrelated org.
+    db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=organization.id, role="alumni"))
+    db_session.commit()
+
+    current_user = _current_user(alumni_user)
+    contexts = build_available_contexts(db_session, current_user)
+
+    slugs = {c.slug for c in contexts}
+    assert national.slug in slugs
+    assert fsu.slug in slugs
+    assert organization.slug in slugs  # the real membership is preserved too
+
+
+def test_temporary_contexts_appear_with_has_active_dataset_false_when_empty(db_session, alumni_user):
+    _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    _make_organization(db_session, "fsu-stars", "FSU STARS", context_type="institution")
+
+    current_user = _current_user(alumni_user)
+    contexts = {c.slug: c for c in build_available_contexts(db_session, current_user)}
+
+    assert contexts["stars-national"].has_active_dataset is False
+    assert contexts["fsu-stars"].has_active_dataset is False
+    # And they are still returned, not hidden, despite having no data.
+    assert "stars-national" in contexts
+    assert "fsu-stars" in contexts
+
+
+def test_temporary_fsu_stars_context_becomes_active_once_linked_alumni_exist(db_session, alumni_user):
+    fsu = _make_organization(db_session, "fsu-stars", "FSU STARS", context_type="institution")
+    current_user = _current_user(alumni_user)
+
+    before = {c.slug: c for c in build_available_contexts(db_session, current_user)}
+    assert before["fsu-stars"].has_active_dataset is False
+
+    _link_active_alumni(db_session, fsu)
+
+    after = {c.slug: c for c in build_available_contexts(db_session, current_user)}
+    assert after["fsu-stars"].has_active_dataset is True
+
+
+def test_temporary_contexts_have_alumni_role_and_cannot_import(db_session, alumni_user):
+    _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    _make_organization(db_session, "fsu-stars", "FSU STARS", context_type="institution")
+
+    current_user = _current_user(alumni_user)
+    contexts = {c.slug: c for c in build_available_contexts(db_session, current_user)}
+
+    for slug in ("stars-national", "fsu-stars"):
+        assert contexts[slug].role == "alumni"
+        assert contexts[slug].can_import is False
+
+
+def test_temporary_policy_does_not_grant_access_to_an_arbitrary_third_institution(
+    db_session, alumni_user, organization
+):
+    _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    _make_organization(db_session, "fsu-stars", "FSU STARS", context_type="institution")
+    other = _make_organization(db_session, "some-other-institution", "Some Other Institution")
+    # An explicit (even if unrelated) membership is required here so this
+    # account is NOT on the zero-membership legacy-fallback path (which
+    # already grants unrestricted access to every organization, for
+    # unrelated reasons - see the module docstring) - this isolates the
+    # temporary policy's own boundary specifically.
+    db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=organization.id, role="alumni"))
+    db_session.commit()
+
+    current_user = _current_user(alumni_user)
+    contexts = build_available_contexts(db_session, current_user)
+
+    assert all(c.slug != other.slug for c in contexts)
+
+    with pytest.raises(HTTPException) as exc_info:
+        get_authorized_organization(organization=other.slug, current_user=current_user, db=db_session)
+    assert exc_info.value.status_code == 403
+
+
+def test_temporary_policy_authorizes_read_context_for_stars_national_and_fsu_stars(db_session, alumni_user):
+    """get_authorized_organization (used directly by admin routes, and
+    potentially future alumni-facing endpoints) grants read-context
+    access under the temporary rule - always at effective_role="alumni",
+    never elevated - even when the account's only real membership is
+    unrelated."""
+    _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    _make_organization(db_session, "fsu-stars", "FSU STARS", context_type="institution")
+    unrelated = _make_organization(db_session, "unrelated-org", "Unrelated Org")
+    db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=unrelated.id, role="alumni"))
+    db_session.commit()
+
+    current_user = _current_user(alumni_user)
+    for slug in ("stars-national", "fsu-stars"):
+        access = get_authorized_organization(organization=slug, current_user=current_user, db=db_session)
+        assert access.organization.slug == slug
+        assert access.effective_role == "alumni"
+
+
+def test_temporary_policy_never_applies_to_admin_effective_global_role(db_session, admin_user, organization):
+    """An admin account with an unrelated explicit membership must NOT
+    get the temporary alumni carve-out - it should still be a plain 403,
+    exactly as before this policy existed."""
+    _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    db_session.add(UserOrganization(user_id=admin_user.id, organization_id=organization.id, role="admin"))
+    db_session.commit()
+
+    current_user = _current_user(admin_user)
+    with pytest.raises(HTTPException) as exc_info:
+        get_authorized_organization(organization="stars-national", current_user=current_user, db=db_session)
+    assert exc_info.value.status_code == 403
+
+
+def test_available_contexts_are_returned_in_deterministic_order(db_session, alumni_user):
+    """National first, then alphabetically by display name - regardless
+    of frozenset/query iteration order, and regardless of which contexts
+    came from the temporary policy vs. a real membership/legacy
+    fallback."""
+    _make_organization(db_session, "fsu-stars", "FSU STARS", context_type="institution")
+    _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    aaa = _make_organization(db_session, "aaa-institution", "AAA Institution", context_type="institution")
+    _link_active_alumni(db_session, aaa)
+
+    current_user = _current_user(alumni_user)
+    contexts = build_available_contexts(db_session, current_user)
+    slugs_in_order = [c.slug for c in contexts]
+
+    national_indices = [i for i, c in enumerate(contexts) if c.context_type == "national"]
+    non_national_indices = [i for i, c in enumerate(contexts) if c.context_type != "national"]
+    assert not national_indices or max(national_indices) < min(non_national_indices)
+
+    non_national_display_names = [c.display_name for c in contexts if c.context_type != "national"]
+    assert non_national_display_names == sorted(non_national_display_names)
+    _ = slugs_in_order
+
+
+def test_temporary_contexts_expose_no_internal_organization_ids(client, alumni_user):
+    token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
+    response = client.get("/organizations/available-contexts", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    for context in response.json()["contexts"]:
+        assert set(context.keys()) == {
+            "slug", "display_name", "context_type", "role", "has_active_dataset", "can_import", "theme_key",
+        }
 
 
 def test_endpoint_is_read_only_and_does_not_alter_user_or_session_state(

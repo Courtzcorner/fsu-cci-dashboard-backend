@@ -5,6 +5,7 @@ changes take effect immediately), and organization resolution for
 alumni/content endpoints.
 """
 from dataclasses import dataclass
+from typing import Optional
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -12,7 +13,9 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.organization import Organization
+from app.models.roles import resolve_effective_role
 from app.models.user import User
+from app.models.user_organization import UserOrganization
 from app.security import TokenError, decode_access_token
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -130,6 +133,80 @@ def get_organization_by_slug_for_current_user(
     if organization_record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
     return organization_record
+
+
+@dataclass(frozen=True)
+class OrganizationAccess:
+    """Result of resolving+authorizing an organization context for the
+    current user (see get_authorized_organization below)."""
+
+    organization: Organization
+    effective_role: str
+    membership: Optional[UserOrganization]
+    # True only for a legacy account with zero UserOrganization rows at
+    # all - i.e. one still running under the temporary rollout-compatible
+    # fallback described in app.services.organization_context_service,
+    # not the final per-organization authorization model.
+    is_legacy_access: bool
+
+
+def get_authorized_organization(
+    organization: str | None = None,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> OrganizationAccess:
+    """Phase 1 authorization dependency - NOT yet wired into any existing
+    endpoint (see app.routers.organization_routes for its only current
+    caller). Resolves `?organization=` (falling back to
+    DEFAULT_ORGANIZATION_SLUG when omitted, exactly like
+    get_organization_by_slug_for_current_user) and then authorizes it:
+
+    - A user with at least one UserOrganization row is restricted to
+      exactly their memberships; any other organization is a 403.
+    - A user with zero UserOrganization rows at all (every account today,
+      until a future backfill) keeps today's unrestricted behavior -
+      this is TEMPORARY ROLLOUT COMPATIBILITY, not the final model, and
+      is expected to disappear once real memberships are backfilled.
+    - Either way, the effective role is validated against the
+      application's supported roles (see app.models.roles) and never
+      silently treated as admin if unrecognized - an invalid role fails
+      closed with 403.
+    """
+    from app.config import get_settings
+
+    slug = organization or get_settings().default_organization_slug
+    organization_record = db.query(Organization).filter(Organization.slug == slug).first()
+    if organization_record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+
+    memberships = db.query(UserOrganization).filter(UserOrganization.user_id == current_user.id).all()
+
+    if not memberships:
+        effective_role = resolve_effective_role(None, current_user.role)
+        if effective_role is None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account role is not recognized")
+        return OrganizationAccess(
+            organization=organization_record, effective_role=effective_role, membership=None, is_legacy_access=True
+        )
+
+    matching_membership = next(
+        (m for m in memberships if m.organization_id == organization_record.id), None
+    )
+    if matching_membership is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this organization"
+        )
+
+    effective_role = resolve_effective_role(matching_membership.role, current_user.role)
+    if effective_role is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Membership role is not recognized")
+
+    return OrganizationAccess(
+        organization=organization_record,
+        effective_role=effective_role,
+        membership=matching_membership,
+        is_legacy_access=False,
+    )
 
 
 def require_admin_role(current_user: CurrentUser) -> None:

@@ -13,6 +13,7 @@ from app.routers.alumni_routes import router as alumni_router
 from app.routers.analytics_routes import router as analytics_router
 from app.routers.auth_routes import limiter, router as auth_router
 from app.routers.content_routes import router as content_router
+from app.routers.organization_routes import router as organization_router
 from app.routers.profile_routes import router as profile_router
 from app.routers.public_profile_routes import router as public_profile_router
 from app.routers.sync_routes import router as sync_router
@@ -109,6 +110,7 @@ app.include_router(alumni_router)
 app.include_router(analytics_router)
 app.include_router(admin_router)
 app.include_router(content_router)
+app.include_router(organization_router)
 app.include_router(profile_router)
 app.include_router(user_profile_router)
 app.include_router(public_profile_router)

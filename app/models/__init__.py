@@ -7,6 +7,7 @@ from app.models.location_alias import LocationAlias
 from app.models.organization import Organization
 from app.models.reference import Company, Industry, University
 from app.models.user import User
+from app.models.user_organization import UserOrganization
 from app.models.user_profile import (
     ProfileMatchCandidate,
     UserEducationHistory,
@@ -32,6 +33,7 @@ __all__ = [
     "University",
     "User",
     "UserEducationHistory",
+    "UserOrganization",
     "UserProfile",
     "UserWorkHistory",
 ]

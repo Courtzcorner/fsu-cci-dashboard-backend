@@ -157,14 +157,17 @@ FIELD_ALIASES: dict[str, list[str]] = {
     "profile_headline": ["profile_headline", "headline", "linkedin_headline"],
     "employment_tenure": ["employment_tenure", "tenure"],
     "employment_type": ["employment_type", "job_type"],
+    # Unlike the three fields above, "email" IS persisted - to
+    # alumni.email - and used (after normalized LinkedIn URL) as a
+    # dedupe/match key on reimport. See field_values["email"] below.
     "email": ["email"],
     "notes": ["notes", "note", "comments", "comment"],
 }
 
-# Note: "profile_headline", "employment_tenure", "employment_type", and
-# "email" are recognized (won't show up as unrecognized_headers) but have
-# no backing Alumni column yet, so they are intentionally never added to
-# field_values below.
+# Note: "profile_headline", "employment_tenure", and "employment_type" are
+# recognized (won't show up as unrecognized_headers) but have no backing
+# Alumni column yet, so they are intentionally never added to
+# field_values below. "email" and "notes" ARE persisted - see above.
 
 # Headers that are recognized (so they never show up in
 # unrecognized_headers) but whose target field can't be decided purely

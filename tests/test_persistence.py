@@ -20,10 +20,11 @@ CSV_249_ROWS = "First Name,Last Name,Graduation Year,Location\n" + "".join(
 )
 
 
-def _upload(client, token, organization_slug, csv_text, filename="alumni.csv"):
+def _upload(client, token, csv_text, filename="alumni.csv"):
+    """POST /admin/import-alumni no longer accepts (or requires) an
+    organization form field at all - there is only one dashboard/dataset."""
     return client.post(
         "/admin/import-alumni",
-        data={"organization": organization_slug},
         files={"file": (filename, io.BytesIO(csv_text.encode("utf-8")), "text/csv")},
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -31,7 +32,7 @@ def _upload(client, token, organization_slug, csv_text, filename="alumni.csv"):
 
 def test_1_admin_import_reports_database_total(client, admin_user, organization):
     token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
-    response = _upload(client, token, "fsu-cci", CSV_249_ROWS)
+    response = _upload(client, token, CSV_249_ROWS)
     assert response.status_code == 200
     body = response.json()
     assert body["created"] == 249
@@ -43,7 +44,7 @@ def test_1_admin_import_reports_database_total(client, admin_user, organization)
 
 def test_2_a_second_request_still_retrieves_the_imported_records(client, admin_user, organization):
     token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
-    _upload(client, token, "fsu-cci", CSV_249_ROWS)
+    _upload(client, token, CSV_249_ROWS)
 
     second_response = client.get(
         "/alumni-data",
@@ -56,7 +57,7 @@ def test_2_a_second_request_still_retrieves_the_imported_records(client, admin_u
 
 def test_3_a_newly_authenticated_alumni_user_retrieves_the_records(client, admin_user, alumni_user, organization):
     admin_token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
-    _upload(client, admin_token, "fsu-cci", CSV_249_ROWS)
+    _upload(client, admin_token, CSV_249_ROWS)
 
     alumni_token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
     response = client.get(
@@ -75,7 +76,7 @@ def test_3_a_newly_authenticated_alumni_user_retrieves_the_records(client, admin
 
 def test_4_records_still_exist_in_a_brand_new_database_session(client, admin_user, organization):
     token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
-    _upload(client, token, "fsu-cci", CSV_249_ROWS)
+    _upload(client, token, CSV_249_ROWS)
 
     # Dispose the connection pool and open a completely fresh session, to
     # rule out any request-scoped/in-memory caching.
@@ -95,7 +96,7 @@ def test_4_records_still_exist_in_a_brand_new_database_session(client, admin_use
 
 def test_5_admin_can_sign_out_and_sign_back_in_and_still_see_the_records(client, admin_user, organization):
     first_token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
-    _upload(client, first_token, "fsu-cci", CSV_249_ROWS)
+    _upload(client, first_token, CSV_249_ROWS)
 
     # "Sign out" - the client simply discards the token; there is no
     # server-side session to invalidate, which is itself proof state
@@ -113,7 +114,7 @@ def test_5_admin_can_sign_out_and_sign_back_in_and_still_see_the_records(client,
 
 def test_6_alumni_user_cannot_import_a_csv(client, alumni_user, organization):
     token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
-    response = _upload(client, token, "fsu-cci", CSV_249_ROWS)
+    response = _upload(client, token, CSV_249_ROWS)
     assert response.status_code == 403
 
 
@@ -133,12 +134,12 @@ def test_7_alumni_user_can_edit_only_their_own_profile(client, alumni_user, othe
 
 def test_import_updates_existing_records_without_duplicating(client, admin_user, organization, db_session):
     token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
-    _upload(client, token, "fsu-cci", CSV_249_ROWS)
+    _upload(client, token, CSV_249_ROWS)
 
     # Change a non-key field (location) - graduation year stays the same so
     # the dedup match (first/last name + graduation year + org) still hits.
     updated_csv = CSV_249_ROWS.replace("Tallahassee, FL", "Miami, FL")
-    response = _upload(client, token, "fsu-cci", updated_csv)
+    response = _upload(client, token, updated_csv)
     body = response.json()
     assert body["created"] == 0
     assert body["updated"] == 249
@@ -160,7 +161,7 @@ def test_import_transaction_rolls_back_on_unexpected_failure(client, admin_user,
     monkeypatch.setattr(csv_import_service, "CSVImport", _boom)
 
     token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
-    response = _upload(client, token, "fsu-cci", CSV_249_ROWS)
+    response = _upload(client, token, CSV_249_ROWS)
     assert response.status_code == 500
 
     assert db_session.query(Alumni).count() == 0

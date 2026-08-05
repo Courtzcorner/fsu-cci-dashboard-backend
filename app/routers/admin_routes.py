@@ -29,7 +29,7 @@ from app.services.profile_link_service import admin_approve, admin_reject, sync_
 
 EXPORT_COLUMNS = [
     "First Name", "Last Name", "Email", "LinkedIn URL", "Company Name", "Job Title",
-    "City", "State", "Education", "Verification Status", "Verification Date",
+    "City", "State", "Education", "Notes", "Verification Status", "Verification Date",
     "Industry", "Industry Source", "Career Category", "Career Category Source",
     "Seniority", "Seniority Source",
     # Effective-data layer: original imported value, user-supplied
@@ -287,6 +287,7 @@ def _export_row(alumni: Alumni, profile: UserProfile | None) -> list:
         alumni.city,
         alumni.state,
         alumni.university,
+        alumni.notes,
         alumni.verification_status,
         alumni.verification_date.isoformat() if alumni.verification_date else "",
         alumni.industry,

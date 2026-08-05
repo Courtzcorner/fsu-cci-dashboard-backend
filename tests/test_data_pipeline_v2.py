@@ -324,7 +324,8 @@ def test_export_alumni_contains_imported_and_derived_columns(client, organizatio
     csv_text = (
         CANONICAL_HEADER + "\n"
         "Bonney,Emma,emmabonney8@example.com,https://linkedin.com/in/emmabonney,"
-        "Blue Cross,Strategy Consultant II,Indianapolis,IN,,Updated,2026-06-15,Florida State University\n"
+        "Blue Cross,Strategy Consultant II,Indianapolis,IN,Great mentor for new grads,"
+        "Updated,2026-06-15,Florida State University\n"
     )
     _upload(client, token, csv_text)
 
@@ -340,6 +341,7 @@ def test_export_alumni_contains_imported_and_derived_columns(client, organizatio
     assert row["Last Name"] == "Bonney"
     assert row["Company Name"] == "Blue Cross"
     assert row["Education"] == "Florida State University"
+    assert row["Notes"] == "Great mentor for new grads"
     assert row["Career Category"]
     assert row["Career Category Source"] == "derived:title_rules"
     assert row["Seniority Source"] in ("derived:title_rules", "unknown")

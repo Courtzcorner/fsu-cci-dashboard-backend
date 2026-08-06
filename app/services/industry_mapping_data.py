@@ -41,12 +41,40 @@ app.services.industry_backfill_service.normalize_company_name):
 # specific organization override below exists for the same normalized
 # name (see ORGANIZATION_COMPANY_INDUSTRY_OVERRIDES). Keys are already
 # normalized (lowercase, no punctuation, no corporate suffix).
+#
+# Note on "the walt disney": "The Walt Disney Company" and the approved
+# alias "The Walt Disney" both already normalize to this exact same key
+# via the existing trailing-corporate-suffix strip ("Company" is a
+# recognized suffix word - see
+# app.services.industry_backfill_service.normalize_company_name), so no
+# separate APPROVED_COMPANY_ALIASES entry is needed for that alias. Bare
+# "Disney" normalizes to "disney" and deliberately does NOT match.
 GLOBAL_DEFAULT_COMPANY_INDUSTRY: dict[str, str] = {
     "capital one": "Financial Services",
     "florida state university": "Education",
     "tallahassee memorial healthcare": "Healthcare",
     "deloitte": "Consulting",
     "microsoft": "Technology",
+    "citi bank": "Financial Services",
+    "general motors": "Automotive",
+    "a-lign": "Cybersecurity",
+    "ibm": "Technology",
+    "lockheed martin": "Aerospace & Defense",
+    "pwc": "Consulting",
+    "aptean": "Technology",
+    "booz allen hamilton": "Consulting",
+    "boston dynamics": "Robotics",
+    "brandt information services": "Technology",
+    "google": "Technology",
+    "l3harris technologies": "Aerospace & Defense",
+    "morgan stanley": "Financial Services",
+    "oracle": "Technology",
+    "rsm": "Consulting",
+    "state farm": "Insurance",
+    "the walt disney": "Media & Entertainment",
+    "2u": "Education Technology",
+    "adventhealth": "Healthcare",
+    "advertising specialty institute": "Marketing & Advertising",
 }
 
 # Organization-slug-scoped overrides/additions - reviewed the same way as

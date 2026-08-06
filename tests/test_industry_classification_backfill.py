@@ -14,6 +14,8 @@ here modifies or depends on changing app.services.classification_service,
 app.services.effective_profile_service, app.services.effective_alumni_service,
 or app.routers.analytics_routes.
 """
+import pytest
+
 from app.models.alumni import Alumni, AlumniOrganization
 from app.models.reference import Company
 from app.services.industry_backfill_service import (
@@ -87,7 +89,156 @@ def test_initial_mapping_list_matches_the_five_approved_entries():
         "tallahassee memorial healthcare": "Healthcare",
         "deloitte": "Consulting",
         "microsoft": "Technology",
+        "citi bank": "Financial Services",
+        "general motors": "Automotive",
+        "a-lign": "Cybersecurity",
+        "ibm": "Technology",
+        "lockheed martin": "Aerospace & Defense",
+        "pwc": "Consulting",
+        "aptean": "Technology",
+        "booz allen hamilton": "Consulting",
+        "boston dynamics": "Robotics",
+        "brandt information services": "Technology",
+        "google": "Technology",
+        "l3harris technologies": "Aerospace & Defense",
+        "morgan stanley": "Financial Services",
+        "oracle": "Technology",
+        "rsm": "Consulting",
+        "state farm": "Insurance",
+        "the walt disney": "Media & Entertainment",
+        "2u": "Education Technology",
+        "adventhealth": "Healthcare",
+        "advertising specialty institute": "Marketing & Advertising",
     }
+
+
+@pytest.mark.parametrize(
+    "company_name,expected_industry",
+    [
+        ("Citi Bank", "Financial Services"),
+        ("General Motors", "Automotive"),
+        ("A-LIGN", "Cybersecurity"),
+        ("IBM", "Technology"),
+        ("Lockheed Martin", "Aerospace & Defense"),
+        ("PwC", "Consulting"),
+        ("Aptean", "Technology"),
+        ("Booz Allen Hamilton", "Consulting"),
+        ("Boston Dynamics", "Robotics"),
+        ("Brandt Information Services", "Technology"),
+        ("Google", "Technology"),
+        ("L3Harris Technologies", "Aerospace & Defense"),
+        ("Morgan Stanley", "Financial Services"),
+        ("Oracle", "Technology"),
+        ("RSM", "Consulting"),
+        ("State Farm", "Insurance"),
+        ("The Walt Disney Company", "Media & Entertainment"),
+        ("The Walt Disney", "Media & Entertainment"),  # approved alias (see below)
+        ("2U", "Education Technology"),
+        ("AdventHealth", "Healthcare"),
+        ("Advertising Specialty Institute", "Marketing & Advertising"),
+    ],
+)
+def test_new_reviewed_mapping_resolves_via_normalized_exact_match(company_name, expected_industry):
+    normalized = normalize_company_name(company_name)
+    assert resolve_curated_industry(normalized, "fsu-stars") == expected_industry
+
+
+@pytest.mark.parametrize("company_name,alumni_company", [
+    ("Citi Bank", "Citi Bank"),
+    ("General Motors", "General Motors"),
+    ("A-LIGN", "A-LIGN"),
+    ("IBM", "IBM"),
+    ("Lockheed Martin", "Lockheed Martin"),
+    ("PwC", "PwC"),
+    ("Aptean", "Aptean"),
+    ("Booz Allen Hamilton", "Booz Allen Hamilton"),
+    ("Boston Dynamics", "Boston Dynamics"),
+    ("Brandt Information Services", "Brandt Information Services"),
+    ("Google", "Google"),
+    ("L3Harris Technologies", "L3Harris Technologies"),
+    ("Morgan Stanley", "Morgan Stanley"),
+    ("Oracle", "Oracle"),
+    ("RSM", "RSM"),
+    ("State Farm", "State Farm"),
+    ("The Walt Disney Company", "The Walt Disney Company"),
+    ("The Walt Disney", "The Walt Disney"),
+    ("2U", "2U"),
+    ("AdventHealth", "AdventHealth"),
+    ("Advertising Specialty Institute", "Advertising Specialty Institute"),
+])
+def test_new_mapping_backfills_company_and_alumni_end_to_end(db_session, organization, company_name, alumni_company):
+    normalized = normalize_company_name(company_name)
+    expected_industry = resolve_curated_industry(normalized, organization.slug)
+    company = _add_company(db_session, organization, company_name)
+    alumni = _add_alumni(db_session, organization, company=alumni_company)
+
+    run_backfill(db_session, organization, apply=True)
+    db_session.commit()
+
+    db_session.refresh(company)
+    db_session.refresh(alumni)
+    assert company.industry == expected_industry
+    assert alumni.industry == expected_industry
+    assert alumni.industry_source == INDUSTRY_SOURCE_COMPANY_MAPPING
+    # Original text must remain byte-for-byte unchanged.
+    assert company.name == company_name
+    assert alumni.company == alumni_company
+
+
+def test_the_walt_disney_alias_resolves_to_the_same_industry_as_canonical(db_session, organization):
+    """"The Walt Disney" is the approved alias for "The Walt Disney
+    Company" - both normalize (via the existing trailing corporate-
+    suffix strip) to the identical key, so they must classify
+    identically."""
+    company_full = _add_company(db_session, organization, "The Walt Disney Company")
+    alumni_alias = _add_alumni(db_session, organization, company="The Walt Disney")
+
+    run_backfill(db_session, organization, apply=True)
+    db_session.commit()
+
+    db_session.refresh(company_full)
+    db_session.refresh(alumni_alias)
+    assert company_full.industry == "Media & Entertainment"
+    assert alumni_alias.industry == "Media & Entertainment"
+    assert alumni_alias.company == "The Walt Disney"
+
+
+def test_disney_alone_does_not_match_the_walt_disney_mapping():
+    normalized = normalize_company_name("Disney")
+    assert normalized == "disney"
+    assert resolve_curated_industry(normalized, "fsu-stars") is None
+
+
+def test_general_motor_does_not_match_general_motors():
+    normalized = normalize_company_name("General Motor")
+    assert normalized == "general motor"
+    assert resolve_curated_industry(normalized, "fsu-stars") is None
+
+
+def test_citi_alone_does_not_match_citi_bank():
+    normalized = normalize_company_name("Citi")
+    assert normalized == "citi"
+    assert resolve_curated_industry(normalized, "fsu-stars") is None
+
+
+def test_state_alone_does_not_match_state_farm():
+    normalized = normalize_company_name("State")
+    assert normalized == "state"
+    assert resolve_curated_industry(normalized, "fsu-stars") is None
+
+
+def test_disney_alone_remains_unclassified_end_to_end(db_session, organization):
+    company = _add_company(db_session, organization, "Disney")
+    alumni = _add_alumni(db_session, organization, company="Disney")
+
+    report = run_backfill(db_session, organization, apply=True)
+    db_session.commit()
+
+    db_session.refresh(company)
+    db_session.refresh(alumni)
+    assert company.industry is None
+    assert alumni.industry is None
+    assert report.unknown_companies_skipped == 1
 
 
 # --------------------------------------------------------------------------
@@ -509,8 +660,6 @@ def test_rollback_refuses_organization_mismatch(db_session, organization, other_
     _add_company(db_session, organization, "Deloitte")
     report = run_backfill(db_session, organization, apply=True)
     db_session.commit()
-
-    import pytest
 
     with pytest.raises(ValueError):
         rollback_backfill(db_session, other_organization, report.manifest)

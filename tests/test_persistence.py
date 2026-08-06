@@ -59,10 +59,16 @@ def test_3_a_newly_authenticated_alumni_user_retrieves_the_records(client, admin
     admin_token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
     _upload(client, admin_token, CSV_249_ROWS)
 
+    # Deliberately omits `organization=` (relying on
+    # DEFAULT_ORGANIZATION_SLUG, itself "fsu-cci") rather than passing it
+    # explicitly - an alumni EXPLICITLY requesting fsu-cci is now blocked
+    # (see app.services.hidden_context_policy), but every existing caller
+    # that omits the param entirely, resolving to the same fsu-cci
+    # dataset by default, must keep working unchanged.
     alumni_token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
     response = client.get(
         "/alumni-data",
-        params={"organization": "fsu-cci", "page_size": 200},
+        params={"page_size": 200},
         headers={"Authorization": f"Bearer {alumni_token}"},
     )
     assert response.status_code == 200

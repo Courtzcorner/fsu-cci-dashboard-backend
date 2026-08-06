@@ -28,6 +28,15 @@ account's UserOrganization rows (none, or some that don't include them),
 "institution with no active dataset" rule below. This is intentionally
 narrow (exactly those two slugs, exactly effective-global-role "alumni")
 and never elevates role or grants import/admin capability.
+
+HIDDEN CONTEXT POLICY (also temporary - see
+app.services.hidden_context_policy): `fsu-cci` is unconditionally excluded
+from this list for EVERY user - legacy, explicit-membership, admin, or
+alumni - regardless of role or active-dataset state. This is checked
+first, before any role/dataset filtering below, so none of those rules
+(including the temporary alumni compatibility one above) can ever
+reintroduce it. This never touches fsu-cci's data - see that module's
+docstring.
 """
 from sqlalchemy.orm import Session
 
@@ -37,6 +46,7 @@ from app.models.organization import Organization
 from app.models.roles import UserRole, resolve_effective_role
 from app.models.user_organization import UserOrganization
 from app.schemas.organization import AvailableContextOut
+from app.services.hidden_context_policy import is_hidden_organization_slug
 from app.services.temporary_alumni_context_policy import (
     TEMPORARY_ALUMNI_COMPATIBLE_SLUGS,
     is_temporary_alumni_compatibility_slug,
@@ -91,6 +101,14 @@ def build_available_contexts(db: Session, current_user: CurrentUser) -> list[Ava
     results: list[AvailableContextOut] = []
 
     for organization, raw_role in _candidate_organizations_with_roles(db, current_user):
+        if is_hidden_organization_slug(organization.slug):
+            # Checked first, before role/dataset filtering, so a hidden
+            # organization is excluded unconditionally - regardless of
+            # role (admin included) or active-dataset state - and no
+            # later rule (e.g. the temporary alumni compatibility one)
+            # can ever reintroduce it.
+            continue
+
         effective_role = resolve_effective_role(raw_role, current_user.role)
         if effective_role is None:
             # Fail closed: an unrecognized role (per-org override or the
@@ -151,6 +169,8 @@ def _temporary_alumni_compatibility_contexts(
     additions: list[AvailableContextOut] = []
 
     for slug in TEMPORARY_ALUMNI_COMPATIBLE_SLUGS:
+        if is_hidden_organization_slug(slug):
+            continue
         if slug in seen_slugs or not is_temporary_alumni_compatibility_slug(slug, effective_global_role):
             continue
         organization = db.query(Organization).filter(Organization.slug == slug).first()

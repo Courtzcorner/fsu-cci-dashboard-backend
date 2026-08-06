@@ -83,11 +83,17 @@ def test_full_import_and_shared_read_persistence_flow(client, admin_user, alumni
     assert admin_body["meta"]["total"] == 3
     admin_names = {row["full_name"] for row in admin_body["data"]}
 
-    # 5. Call GET /alumni-data as a different, newly-authenticated alumni user.
+    # 5. Call GET /alumni-data as a different, newly-authenticated alumni
+    #    user. Deliberately omits `organization=` (relying on
+    #    DEFAULT_ORGANIZATION_SLUG, itself "fsu-cci") rather than passing
+    #    it explicitly - an alumni EXPLICITLY requesting fsu-cci is now
+    #    blocked (see app.services.hidden_context_policy), but every
+    #    existing caller that omits the param entirely, resolving to the
+    #    same fsu-cci dataset by default, must keep working unchanged.
     alumni_token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
     alumni_read = client.get(
         "/alumni-data",
-        params={"organization": "fsu-cci", "page_size": 5000},
+        params={"page_size": 5000},
         headers={"Authorization": f"Bearer {alumni_token}"},
     )
     assert alumni_read.status_code == 200

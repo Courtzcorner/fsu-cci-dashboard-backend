@@ -7,11 +7,17 @@ from app.database import SessionLocal, engine
 from tests.conftest import ADMIN_PASSWORD, ADMIN_USERNAME, ALUMNI_PASSWORD, ALUMNI_USERNAME, login
 
 
-def test_admin_created_event_appears_in_get_events(client, admin_user, alumni_user, organization):
+def test_admin_created_event_appears_in_get_events(client, admin_user, alumni_user, other_organization):
+    # Deliberately `other_organization` (slug "stars-national"), NOT the
+    # `organization` fixture (slug "fsu-cci") - fsu-cci is now a hidden
+    # legacy context and alumni are blocked from explicitly requesting it
+    # (see app.services.hidden_context_policy). Admin write access to
+    # fsu-cci is unaffected, but this test needs the round trip (admin
+    # write + alumni read) to work against a non-hidden org.
     admin_token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
     create_response = client.post(
         "/admin/events",
-        params={"organization": "fsu-cci"},
+        params={"organization": "stars-national"},
         json={
             "title": "Homecoming Mixer",
             "description": "Alumni networking event",
@@ -26,7 +32,7 @@ def test_admin_created_event_appears_in_get_events(client, admin_user, alumni_us
 
     alumni_token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
     list_response = client.get(
-        "/events", params={"organization": "fsu-cci"}, headers={"Authorization": f"Bearer {alumni_token}"}
+        "/events", params={"organization": "stars-national"}, headers={"Authorization": f"Bearer {alumni_token}"}
     )
     assert list_response.status_code == 200
     titles = [e["title"] for e in list_response.json()]
@@ -34,27 +40,31 @@ def test_admin_created_event_appears_in_get_events(client, admin_user, alumni_us
     assert any(e["id"] == event_id for e in list_response.json())
 
 
-def test_unpublished_event_is_hidden_from_get_events(client, admin_user, alumni_user, organization):
+def test_unpublished_event_is_hidden_from_get_events(client, admin_user, alumni_user, other_organization):
+    # Deliberately `other_organization` (slug "stars-national") - see
+    # test_admin_created_event_appears_in_get_events above.
     admin_token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
     client.post(
         "/admin/events",
-        params={"organization": "fsu-cci"},
+        params={"organization": "stars-national"},
         json={"title": "Draft Event", "start_date": "2026-10-01T18:00:00Z", "is_published": False},
         headers={"Authorization": f"Bearer {admin_token}"},
     )
 
     alumni_token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
     response = client.get(
-        "/events", params={"organization": "fsu-cci"}, headers={"Authorization": f"Bearer {alumni_token}"}
+        "/events", params={"organization": "stars-national"}, headers={"Authorization": f"Bearer {alumni_token}"}
     )
     assert "Draft Event" not in [e["title"] for e in response.json()]
 
 
-def test_admin_created_speaker_appears_in_get_speakers(client, admin_user, alumni_user, organization):
+def test_admin_created_speaker_appears_in_get_speakers(client, admin_user, alumni_user, other_organization):
+    # Deliberately `other_organization` (slug "stars-national") - see
+    # test_admin_created_event_appears_in_get_events above.
     admin_token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
     create_response = client.post(
         "/admin/speakers",
-        params={"organization": "fsu-cci"},
+        params={"organization": "stars-national"},
         json={"name": "Dr. Casey Rivera", "job_title": "CTO", "company": "Acme Corp", "is_published": True},
         headers={"Authorization": f"Bearer {admin_token}"},
     )
@@ -62,18 +72,22 @@ def test_admin_created_speaker_appears_in_get_speakers(client, admin_user, alumn
 
     alumni_token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
     response = client.get(
-        "/speakers", params={"organization": "fsu-cci"}, headers={"Authorization": f"Bearer {alumni_token}"}
+        "/speakers", params={"organization": "stars-national"}, headers={"Authorization": f"Bearer {alumni_token}"}
     )
     assert response.status_code == 200
     names = [s["name"] for s in response.json()]
     assert "Dr. Casey Rivera" in names
 
 
-def test_admin_created_super_star_appears_in_get_super_stars(client, admin_user, alumni_user, alumni_record, organization):
+def test_admin_created_super_star_appears_in_get_super_stars(
+    client, admin_user, alumni_user, alumni_record, other_organization
+):
+    # Deliberately `other_organization` (slug "stars-national") - see
+    # test_admin_created_event_appears_in_get_events above.
     admin_token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
     create_response = client.post(
         "/admin/super-stars",
-        params={"organization": "fsu-cci"},
+        params={"organization": "stars-national"},
         json={
             "alumni_id": alumni_record.id,
             "headline": "From intern to industry leader",
@@ -85,7 +99,7 @@ def test_admin_created_super_star_appears_in_get_super_stars(client, admin_user,
 
     alumni_token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
     response = client.get(
-        "/super-stars", params={"organization": "fsu-cci"}, headers={"Authorization": f"Bearer {alumni_token}"}
+        "/super-stars", params={"organization": "stars-national"}, headers={"Authorization": f"Bearer {alumni_token}"}
     )
     assert response.status_code == 200
     headlines = [s["headline"] for s in response.json()]

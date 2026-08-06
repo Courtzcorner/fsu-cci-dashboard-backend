@@ -164,16 +164,21 @@ def test_nonexistent_organization_slug_returns_404(db_session, admin_user):
 # --------------------------------------------------------------------------
 
 
-def test_legacy_admin_sees_institution_context_with_no_active_dataset(db_session, admin_user, organization):
+def test_legacy_admin_sees_institution_context_with_no_active_dataset(db_session, admin_user):
     """Documented Phase 1 legacy-fallback behavior: an admin with zero
-    memberships sees every organization, including an institution context
-    that has no active dataset yet, so they can prepare to import into it."""
+    memberships sees every (non-hidden) organization, including an
+    institution context that has no active dataset yet, so they can
+    prepare to import into it. Deliberately NOT the `organization` fixture
+    (slug "fsu-cci") - that slug is now unconditionally hidden (see
+    app.services.hidden_context_policy), so a separate institution is
+    needed to isolate this legacy-fallback behavior."""
+    other = _make_organization(db_session, "unrelated-institution", "Unrelated Institution")
     current_user = _current_user(admin_user)
     contexts = build_available_contexts(db_session, current_user)
 
     slugs = {c.slug for c in contexts}
-    assert organization.slug in slugs
-    ctx = next(c for c in contexts if c.slug == organization.slug)
+    assert other.slug in slugs
+    ctx = next(c for c in contexts if c.slug == other.slug)
     assert ctx.has_active_dataset is False
     assert ctx.can_import is True
 
@@ -196,12 +201,15 @@ def test_legacy_alumni_does_not_see_institution_context_with_no_active_dataset(
     assert all(c.slug != unrelated.slug for c in contexts)
 
 
-def test_legacy_alumni_sees_institution_context_once_it_has_an_active_dataset(db_session, alumni_user, organization):
-    _link_active_alumni(db_session, organization)
+def test_legacy_alumni_sees_institution_context_once_it_has_an_active_dataset(db_session, alumni_user):
+    # Deliberately NOT the `organization` fixture (slug "fsu-cci") - see
+    # test_legacy_admin_sees_institution_context_with_no_active_dataset.
+    other = _make_organization(db_session, "unrelated-institution", "Unrelated Institution")
+    _link_active_alumni(db_session, other)
     current_user = _current_user(alumni_user)
     contexts = build_available_contexts(db_session, current_user)
 
-    ctx = next((c for c in contexts if c.slug == organization.slug), None)
+    ctx = next((c for c in contexts if c.slug == other.slug), None)
     assert ctx is not None
     assert ctx.has_active_dataset is True
     assert ctx.can_import is False
@@ -217,58 +225,64 @@ def test_national_context_remains_visible_for_legacy_alumni_with_no_active_datas
     assert ctx.has_active_dataset is False
 
 
-def test_membership_based_alumni_sees_only_matching_organizations(db_session, alumni_user, organization):
-    # Deliberately NOT "stars-national"/"fsu-stars" - those two slugs are
-    # now always visible to an alumni account under the temporary
+def test_membership_based_alumni_sees_only_matching_organizations(db_session, alumni_user):
+    # Deliberately NOT the `organization` fixture (slug "fsu-cci", now
+    # unconditionally hidden - see app.services.hidden_context_policy)
+    # and NOT "stars-national"/"fsu-stars" - those two slugs are now
+    # always visible to an alumni account under the temporary
     # compatibility policy (see
-    # app.services.temporary_alumni_context_policy), so a truly
-    # unrelated slug is needed to isolate "membership restricts
-    # candidates to exactly its memberships" in this test.
+    # app.services.temporary_alumni_context_policy), so freshly-created,
+    # otherwise-unrelated slugs are needed to isolate "membership
+    # restricts candidates to exactly its memberships" in this test.
+    member_org = _make_organization(db_session, "member-institution", "Member Institution")
     unrelated = _make_organization(db_session, "unrelated-institution", "Unrelated Institution")
-    _link_active_alumni(db_session, organization)
-    db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=organization.id, role="alumni"))
+    _link_active_alumni(db_session, member_org)
+    db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=member_org.id, role="alumni"))
     db_session.commit()
 
     current_user = _current_user(alumni_user)
     contexts = build_available_contexts(db_session, current_user)
 
     slugs = {c.slug for c in contexts}
-    assert slugs == {organization.slug}
+    assert slugs == {member_org.slug}
     assert unrelated.slug not in slugs
 
 
-def test_national_and_fsu_membership_alumni_sees_both(db_session, alumni_user, organization):
+def test_national_and_fsu_membership_alumni_sees_both(db_session, alumni_user):
+    institution = _make_organization(db_session, "member-institution", "Member Institution")
     national = _make_organization(db_session, "stars-national", "STARS National", context_type="national")
-    _link_active_alumni(db_session, organization)
-    db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=organization.id, role="alumni"))
+    _link_active_alumni(db_session, institution)
+    db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=institution.id, role="alumni"))
     db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=national.id, role="alumni"))
     db_session.commit()
 
     current_user = _current_user(alumni_user)
     contexts = build_available_contexts(db_session, current_user)
 
-    assert {c.slug for c in contexts} == {organization.slug, national.slug}
+    assert {c.slug for c in contexts} == {institution.slug, national.slug}
 
 
-def test_admin_membership_sets_can_import_true(db_session, admin_user, organization):
-    db_session.add(UserOrganization(user_id=admin_user.id, organization_id=organization.id, role="admin"))
+def test_admin_membership_sets_can_import_true(db_session, admin_user):
+    institution = _make_organization(db_session, "member-institution", "Member Institution")
+    db_session.add(UserOrganization(user_id=admin_user.id, organization_id=institution.id, role="admin"))
     db_session.commit()
 
     current_user = _current_user(admin_user)
     contexts = build_available_contexts(db_session, current_user)
-    ctx = next(c for c in contexts if c.slug == organization.slug)
+    ctx = next(c for c in contexts if c.slug == institution.slug)
     assert ctx.can_import is True
     assert ctx.role == "admin"
 
 
-def test_alumni_membership_sets_can_import_false(db_session, alumni_user, organization):
-    _link_active_alumni(db_session, organization)
-    db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=organization.id, role="alumni"))
+def test_alumni_membership_sets_can_import_false(db_session, alumni_user):
+    institution = _make_organization(db_session, "member-institution", "Member Institution")
+    _link_active_alumni(db_session, institution)
+    db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=institution.id, role="alumni"))
     db_session.commit()
 
     current_user = _current_user(alumni_user)
     contexts = build_available_contexts(db_session, current_user)
-    ctx = next(c for c in contexts if c.slug == organization.slug)
+    ctx = next(c for c in contexts if c.slug == institution.slug)
     assert ctx.can_import is False
     assert ctx.role == "alumni"
 
@@ -287,7 +301,11 @@ def test_invalid_membership_role_is_excluded_from_available_contexts(db_session,
 # --------------------------------------------------------------------------
 
 
-def test_endpoint_response_contains_no_internal_database_ids(client, admin_user, organization):
+def test_endpoint_response_contains_no_internal_database_ids(client, admin_user, organization, db_session):
+    # `organization` (fsu-cci) is now unconditionally hidden - see
+    # app.services.hidden_context_policy - so a second, visible
+    # institution is added to guarantee at least one context is returned.
+    _make_organization(db_session, "member-institution", "Member Institution")
     token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
     response = client.get("/organizations/available-contexts", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
@@ -300,30 +318,36 @@ def test_endpoint_response_contains_no_internal_database_ids(client, admin_user,
         }
 
 
-def test_endpoint_legacy_admin_response_shape(client, admin_user, organization):
+def test_endpoint_legacy_admin_response_shape(client, admin_user, organization, db_session):
+    # Deliberately NOT the `organization` fixture (slug "fsu-cci", now
+    # unconditionally hidden - see app.services.hidden_context_policy).
+    institution = _make_organization(db_session, "member-institution", "Member Institution")
     token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
     response = client.get("/organizations/available-contexts", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     contexts = {c["slug"]: c for c in response.json()["contexts"]}
-    assert contexts[organization.slug]["role"] == "admin"
-    assert contexts[organization.slug]["can_import"] is True
+    assert contexts[institution.slug]["role"] == "admin"
+    assert contexts[institution.slug]["can_import"] is True
 
 
 def test_endpoint_legacy_alumni_response_shape(client, alumni_user, organization, db_session):
-    # Deliberately a freshly created org, NOT `other_organization` (slug
-    # "stars-national") - that slug is now always visible to an alumni
-    # account under the temporary compatibility policy (see
+    # Deliberately freshly created orgs, NOT the `organization` fixture
+    # (slug "fsu-cci", now unconditionally hidden - see
+    # app.services.hidden_context_policy) and NOT `other_organization`
+    # (slug "stars-national") - that slug is now always visible to an
+    # alumni account under the temporary compatibility policy (see
     # app.services.temporary_alumni_context_policy).
+    institution = _make_organization(db_session, "member-institution", "Member Institution")
+    _link_active_alumni(db_session, institution)
     unrelated = _make_organization(db_session, "unrelated-institution", "Unrelated Institution")
     token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
     response = client.get("/organizations/available-contexts", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     contexts = {c["slug"]: c for c in response.json()["contexts"]}
-    # This alumni's own alumni record is actively linked to `organization`
-    # (see conftest._make_alumni_with_user), so that context IS visible...
-    assert organization.slug in contexts
-    assert contexts[organization.slug]["role"] == "alumni"
-    assert contexts[organization.slug]["can_import"] is False
+    # `institution` has an active dataset, so it IS visible...
+    assert institution.slug in contexts
+    assert contexts[institution.slug]["role"] == "alumni"
+    assert contexts[institution.slug]["can_import"] is False
     # ...but an unrelated institution context with no active dataset at
     # all is hidden from an alumni account (legacy fallback rule) - see
     # module docstring.
@@ -350,13 +374,16 @@ def test_legacy_alumni_sees_both_temporary_contexts(db_session, alumni_user):
     assert "fsu-stars" in slugs
 
 
-def test_alumni_with_unrelated_explicit_membership_still_sees_both_temporary_contexts(
-    db_session, alumni_user, organization
-):
+def test_alumni_with_unrelated_explicit_membership_still_sees_both_temporary_contexts(db_session, alumni_user):
+    # Deliberately NOT the `organization` fixture (slug "fsu-cci", now
+    # unconditionally hidden - see app.services.hidden_context_policy) as
+    # the "real membership" org.
+    institution = _make_organization(db_session, "member-institution", "Member Institution")
     national = _make_organization(db_session, "stars-national", "STARS National", context_type="national")
     fsu = _make_organization(db_session, "fsu-stars", "FSU STARS", context_type="institution")
+    _link_active_alumni(db_session, institution)
     # The alumni's only explicit membership is to an unrelated org.
-    db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=organization.id, role="alumni"))
+    db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=institution.id, role="alumni"))
     db_session.commit()
 
     current_user = _current_user(alumni_user)
@@ -365,7 +392,7 @@ def test_alumni_with_unrelated_explicit_membership_still_sees_both_temporary_con
     slugs = {c.slug for c in contexts}
     assert national.slug in slugs
     assert fsu.slug in slugs
-    assert organization.slug in slugs  # the real membership is preserved too
+    assert institution.slug in slugs  # the real membership is preserved too
 
 
 def test_temporary_contexts_appear_with_has_active_dataset_false_when_empty(db_session, alumni_user):
@@ -495,6 +522,140 @@ def test_temporary_contexts_expose_no_internal_organization_ids(client, alumni_u
         assert set(context.keys()) == {
             "slug", "display_name", "context_type", "role", "has_active_dataset", "can_import", "theme_key",
         }
+
+
+# --------------------------------------------------------------------------
+# HIDDEN CONTEXT POLICY (fsu-cci) - see app.services.hidden_context_policy.
+# Remove this whole section (and the policy module + its two call sites)
+# once fsu-cci is formally retired or repurposed for a new institution.
+# --------------------------------------------------------------------------
+
+
+def test_fsu_cci_absent_for_legacy_admin(db_session, admin_user, organization):
+    """`organization` (see tests/conftest.py) IS fsu-cci - a legacy admin
+    with zero memberships would otherwise see it via the legacy fallback,
+    including with an active dataset (added here so admin-visibility
+    rules alone could never explain its absence), but the hidden-context
+    policy must exclude it unconditionally."""
+    _link_active_alumni(db_session, organization)
+    current_user = _current_user(admin_user)
+    contexts = build_available_contexts(db_session, current_user)
+    assert all(c.slug != "fsu-cci" for c in contexts)
+
+
+def test_fsu_cci_absent_for_legacy_alumni(db_session, alumni_user, organization):
+    # alumni_user's own alumni record is actively linked to `organization`
+    # (fsu-cci) - see conftest._make_alumni_with_user - so this also
+    # confirms the hidden-context check runs BEFORE the active-dataset
+    # visibility rule, not after.
+    current_user = _current_user(alumni_user)
+    contexts = build_available_contexts(db_session, current_user)
+    assert all(c.slug != "fsu-cci" for c in contexts)
+
+
+def test_fsu_cci_absent_with_explicit_membership(db_session, alumni_user, organization):
+    db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=organization.id, role="alumni"))
+    db_session.commit()
+
+    current_user = _current_user(alumni_user)
+    contexts = build_available_contexts(db_session, current_user)
+    assert all(c.slug != "fsu-cci" for c in contexts)
+
+
+def test_fsu_cci_absent_with_explicit_admin_membership(db_session, admin_user, organization):
+    db_session.add(UserOrganization(user_id=admin_user.id, organization_id=organization.id, role="admin"))
+    db_session.commit()
+
+    current_user = _current_user(admin_user)
+    contexts = build_available_contexts(db_session, current_user)
+    assert all(c.slug != "fsu-cci" for c in contexts)
+
+
+def test_stars_national_and_fsu_stars_remain_available_alongside_hidden_fsu_cci(db_session, alumni_user, organization):
+    _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    _make_organization(db_session, "fsu-stars", "FSU STARS", context_type="institution")
+
+    current_user = _current_user(alumni_user)
+    slugs = {c.slug for c in build_available_contexts(db_session, current_user)}
+
+    assert "stars-national" in slugs
+    assert "fsu-stars" in slugs
+    assert "fsu-cci" not in slugs
+
+
+def test_alumni_direct_fsu_cci_read_returns_403(client, alumni_user, organization):
+    token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
+    response = client.get(
+        "/alumni-data", params={"organization": "fsu-cci"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 403
+    # Generic, non-revealing message - never confirms/denies data exists.
+    assert response.json()["detail"] == "Access denied"
+
+
+def test_alumni_direct_fsu_cci_analytics_read_returns_403(client, alumni_user, organization):
+    token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
+    response = client.get(
+        "/analytics/summary", params={"organization": "fsu-cci"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 403
+
+
+def test_alumni_direct_access_to_stars_national_and_fsu_stars_unchanged(db_session, client, alumni_user):
+    _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    _make_organization(db_session, "fsu-stars", "FSU STARS", context_type="institution")
+    token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
+
+    for slug in ("stars-national", "fsu-stars"):
+        response = client.get(
+            "/alumni-data", params={"organization": slug}, headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200
+
+
+def test_admin_direct_fsu_cci_read_remains_allowed_for_maintenance(client, admin_user, organization):
+    token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    response = client.get(
+        "/alumni-data", params={"organization": "fsu-cci"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 200
+
+
+def test_admin_maintenance_endpoints_can_still_target_fsu_cci(client, admin_user, organization):
+    """The three organization-scoped admin endpoints (which use
+    get_authorized_organization / require_admin_role_for, a completely
+    separate dependency from get_organization_by_slug_for_current_user)
+    must remain unaffected by the hidden-context policy."""
+    token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    current_import = client.get(
+        "/admin/current-import", params={"organization": "fsu-cci"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert current_import.status_code == 200
+
+    export = client.get(
+        "/admin/export-alumni", params={"organization": "fsu-cci"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert export.status_code == 200
+
+
+def test_fsu_cci_data_and_relationship_counts_unchanged_by_hiding_it(db_session, alumni_user, organization):
+    """Hiding fsu-cci from the selector/reads must never touch its
+    underlying data - confirm the Organization row, its Alumni link, and
+    the alumni record itself are all fully intact."""
+    alumni_count_before = (
+        db_session.query(AlumniOrganization).filter(AlumniOrganization.organization_id == organization.id).count()
+    )
+    assert alumni_count_before >= 1
+
+    current_user = _current_user(alumni_user)
+    build_available_contexts(db_session, current_user)  # exercise the hiding path
+
+    db_session.refresh(organization)
+    assert organization.slug == "fsu-cci"
+    alumni_count_after = (
+        db_session.query(AlumniOrganization).filter(AlumniOrganization.organization_id == organization.id).count()
+    )
+    assert alumni_count_after == alumni_count_before
 
 
 def test_endpoint_is_read_only_and_does_not_alter_user_or_session_state(

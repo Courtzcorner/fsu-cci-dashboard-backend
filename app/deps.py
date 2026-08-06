@@ -15,9 +15,10 @@ from app.database import get_db
 from app.models.organization import Organization
 from app.models.roles import UserRole, resolve_effective_role
 from app.models.user import User
-from app.services.temporary_alumni_context_policy import is_temporary_alumni_compatibility_slug
 from app.models.user_organization import UserOrganization
 from app.security import TokenError, decode_access_token
+from app.services.hidden_context_policy import is_hidden_organization_slug
+from app.services.temporary_alumni_context_policy import is_temporary_alumni_compatibility_slug
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -125,10 +126,34 @@ def get_organization_by_slug_for_current_user(
     """Resolve `?organization=` (falling back to DEFAULT_ORGANIZATION_SLUG)
     to an Organization row. Any authenticated user (admin or alumni) may
     view any organization's published content for now.
+
+    HIDDEN CONTEXT POLICY (temporary - see
+    app.services.hidden_context_policy): a non-admin caller who EXPLICITLY
+    passes a hidden slug (currently only `fsu-cci`) as `?organization=` is
+    denied with a plain, generic 403 that never confirms or denies
+    whether the organization or its data actually exists - this must
+    never leak more information than a normal "you can't view this"
+    response would.
+
+    Deliberately checked against the raw `organization` argument, BEFORE
+    the DEFAULT_ORGANIZATION_SLUG fallback below - DEFAULT_ORGANIZATION_SLUG
+    is itself currently `fsu-cci` (today's single-tenant production
+    default), so every existing caller that omits `?organization=`
+    entirely resolves to it and MUST keep working unchanged; only an
+    explicit, deliberate `?organization=fsu-cci` is treated as "selecting"
+    the hidden context and blocked.
+
+    An admin (global `users.role == "admin"`) is NOT restricted here -
+    this endpoint has never done per-organization admin authorization
+    (see get_authorized_organization for that), so admin maintenance
+    access to fsu-cci's data via these read endpoints is preserved
+    unchanged.
     """
     from app.config import get_settings
 
-    _ = current_user  # kept for parity with future per-org access checks
+    if organization is not None and is_hidden_organization_slug(organization) and not current_user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
     slug = organization or get_settings().default_organization_slug
     organization_record = db.query(Organization).filter(Organization.slug == slug).first()
     if organization_record is None:

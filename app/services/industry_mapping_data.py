@@ -49,6 +49,31 @@ app.services.industry_backfill_service.normalize_company_name):
 # app.services.industry_backfill_service.normalize_company_name), so no
 # separate APPROVED_COMPANY_ALIASES entry is needed for that alias. Bare
 # "Disney" normalizes to "disney" and deliberately does NOT match.
+#
+# Note on "eli lilly and": the reviewed canonical name "Eli Lilly and
+# Company" is forced by the SAME pre-existing trailing-corporate-suffix
+# strip to normalize down to "eli lilly and" ("Company" - and, for that
+# matter, "Co" - is a recognized suffix word), so that is the only
+# normalized form that can ever match it; there is no other normalized
+# key this canonical name could use. This is not a new alias - it is
+# simply that canonical name written in its already-normalized form,
+# same convention as every other key below. A documented, deterministic
+# consequence: literal employer text "Eli Lilly and" (without "Company")
+# normalizes to the identical string and therefore also matches - this
+# was investigated and is an accepted, safe, fully deterministic result
+# of the existing normalization design, not a new keyword/substring rule.
+#
+# Note on Amazon: "Amazon" and "Amazon Web Services (AWS)" are kept as
+# two fully separate, explicit canonical entries (not an alias pair) -
+# they normalize to different keys ("amazon" vs.
+# "amazon web services (aws)") under the existing normalization, so they
+# would never merge on their own; keeping both explicit avoids any
+# ambiguity. "Amazon Web Services" (without "(AWS)") normalizes to yet a
+# third, distinct key ("amazon web services") and is deliberately NOT
+# mapped - it remains unknown unless a reviewer explicitly adds it.
+#
+# Note on "c is": deliberately NOT added - too ambiguous to review
+# confidently - so it remains unclassified.
 GLOBAL_DEFAULT_COMPANY_INDUSTRY: dict[str, str] = {
     "capital one": "Financial Services",
     "florida state university": "Education",
@@ -75,6 +100,21 @@ GLOBAL_DEFAULT_COMPANY_INDUSTRY: dict[str, str] = {
     "2u": "Education Technology",
     "adventhealth": "Healthcare",
     "advertising specialty institute": "Marketing & Advertising",
+    "wells fargo": "Financial Services",
+    "bank of america": "Financial Services",
+    "fidelity investments": "Financial Services",
+    "salesforce": "Technology",
+    "sas": "Technology",
+    "north carolina state university": "Education",
+    "amazon": "Technology",
+    "amazon web services (aws)": "Technology",
+    "apple": "Technology",
+    "eli lilly and": "Pharmaceuticals",
+    "duke energy": "Energy & Utilities",
+    "meta": "Technology",
+    "vanguard": "Financial Services",
+    "cgi": "Technology Consulting",
+    "northrop grumman": "Aerospace & Defense",
 }
 
 # Organization-slug-scoped overrides/additions - reviewed the same way as
@@ -104,9 +144,12 @@ ALLOWED_SHORT_ALIASES: frozenset = frozenset({"fsu", "tmh"})
 
 # Never classified as a company/employer, regardless of casing or
 # punctuation - these are employment-STATUS values, not employers.
-# "Self-employed" is deliberately included: rejected unless a future
-# reviewer adds an explicit, reviewed mapping for it.
+# "Self-employed" and "Self employed" (hyphen vs. space - these
+# normalize to two DIFFERENT strings since the existing punctuation strip
+# does not touch hyphens) are both deliberately included: rejected unless
+# a future reviewer adds an explicit, reviewed mapping for one of them.
 BLOCKED_EMPLOYER_VALUES: frozenset = frozenset({
     "Full-time", "Part-time", "Student", "Unemployed", "Not employed",
     "N/A", "Unknown", "None", "Self-employed",
+    "Not stated", "Not specified", "Freelance", "Self employed",
 })

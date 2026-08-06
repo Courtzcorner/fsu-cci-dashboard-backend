@@ -109,6 +109,21 @@ def test_initial_mapping_list_matches_the_five_approved_entries():
         "2u": "Education Technology",
         "adventhealth": "Healthcare",
         "advertising specialty institute": "Marketing & Advertising",
+        "wells fargo": "Financial Services",
+        "bank of america": "Financial Services",
+        "fidelity investments": "Financial Services",
+        "salesforce": "Technology",
+        "sas": "Technology",
+        "north carolina state university": "Education",
+        "amazon": "Technology",
+        "amazon web services (aws)": "Technology",
+        "apple": "Technology",
+        "eli lilly and": "Pharmaceuticals",
+        "duke energy": "Energy & Utilities",
+        "meta": "Technology",
+        "vanguard": "Financial Services",
+        "cgi": "Technology Consulting",
+        "northrop grumman": "Aerospace & Defense",
     }
 
 
@@ -829,3 +844,257 @@ def test_analytics_get_requests_perform_no_industry_writes(client, db_session, o
     db_session.refresh(company)
     assert alumni.industry is None
     assert company.industry is None
+
+
+# ==========================================================================
+# STARS National mapping expansion round 2: new reviewed mappings + new
+# blocked employer/status values, from production dry-run findings.
+# ==========================================================================
+
+
+def test_second_expansion_mapping_list_matches_the_fifteen_new_approved_entries():
+    new_entries = {
+        "wells fargo": "Financial Services",
+        "bank of america": "Financial Services",
+        "fidelity investments": "Financial Services",
+        "salesforce": "Technology",
+        "sas": "Technology",
+        "north carolina state university": "Education",
+        "amazon": "Technology",
+        "amazon web services (aws)": "Technology",
+        "apple": "Technology",
+        "eli lilly and": "Pharmaceuticals",
+        "duke energy": "Energy & Utilities",
+        "meta": "Technology",
+        "vanguard": "Financial Services",
+        "cgi": "Technology Consulting",
+        "northrop grumman": "Aerospace & Defense",
+    }
+    for key, industry in new_entries.items():
+        assert GLOBAL_DEFAULT_COMPANY_INDUSTRY[key] == industry
+
+
+def test_second_expansion_new_blocked_values_are_present_and_existing_ones_unchanged():
+    assert {"Not stated", "Not specified", "Freelance", "Self employed"} <= BLOCKED_EMPLOYER_VALUES
+    # Existing blocked values from the original approved set remain, unchanged.
+    assert {
+        "Full-time", "Part-time", "Student", "Unemployed", "Not employed",
+        "N/A", "Unknown", "None", "Self-employed",
+    } <= BLOCKED_EMPLOYER_VALUES
+
+
+@pytest.mark.parametrize(
+    "company_name,expected_industry",
+    [
+        ("Wells Fargo", "Financial Services"),
+        ("Bank of America", "Financial Services"),
+        ("Fidelity Investments", "Financial Services"),
+        ("Salesforce", "Technology"),
+        ("SAS", "Technology"),
+        ("North Carolina State University", "Education"),
+        ("Amazon", "Technology"),
+        ("Amazon Web Services (AWS)", "Technology"),
+        ("Apple", "Technology"),
+        ("Eli Lilly and Company", "Pharmaceuticals"),
+        ("Duke Energy", "Energy & Utilities"),
+        ("Meta", "Technology"),
+        ("Vanguard", "Financial Services"),
+        ("CGI", "Technology Consulting"),
+        ("Northrop Grumman", "Aerospace & Defense"),
+    ],
+)
+def test_second_expansion_new_mapping_resolves_via_normalized_exact_match(company_name, expected_industry):
+    normalized = normalize_company_name(company_name)
+    assert resolve_curated_industry(normalized, "stars-national") == expected_industry
+
+
+@pytest.mark.parametrize("company_name", [
+    "Wells Fargo", "Bank of America", "Fidelity Investments", "Salesforce", "SAS",
+    "North Carolina State University", "Amazon", "Amazon Web Services (AWS)", "Apple",
+    "Eli Lilly and Company", "Duke Energy", "Meta", "Vanguard", "CGI", "Northrop Grumman",
+])
+def test_second_expansion_new_mapping_backfills_company_and_alumni_end_to_end(db_session, organization, company_name):
+    normalized = normalize_company_name(company_name)
+    expected_industry = resolve_curated_industry(normalized, organization.slug)
+    assert expected_industry is not None
+
+    company = _add_company(db_session, organization, company_name)
+    alumni = _add_alumni(db_session, organization, company=company_name)
+
+    run_backfill(db_session, organization, apply=True)
+    db_session.commit()
+
+    db_session.refresh(company)
+    db_session.refresh(alumni)
+    assert company.industry == expected_industry
+    assert alumni.industry == expected_industry
+    assert alumni.industry_source == INDUSTRY_SOURCE_COMPANY_MAPPING
+    assert company.name == company_name
+    assert alumni.company == company_name
+
+
+@pytest.mark.parametrize("blocked_value", ["not stated", "not specified", "freelance", "self employed"])
+def test_second_expansion_new_blocked_values_remain_unclassified_end_to_end(db_session, organization, blocked_value):
+    alumni = _add_alumni(db_session, organization, company=blocked_value)
+
+    report = run_backfill(db_session, organization, apply=True)
+    db_session.commit()
+
+    db_session.refresh(alumni)
+    assert alumni.industry is None
+    assert report.invalid_employer_values_skipped == 1
+    assert alumni.company == blocked_value
+
+
+def test_amazon_web_services_without_aws_suffix_does_not_partially_match():
+    """"Amazon Web Services" (without the "(AWS)" suffix) must remain
+    unknown - it normalizes to a distinct key from both "amazon" and
+    "amazon web services (aws)", and no partial/substring match is ever
+    performed."""
+    normalized = normalize_company_name("Amazon Web Services")
+    assert normalized == "amazon web services"
+    assert resolve_curated_industry(normalized, "stars-national") is None
+
+
+def test_amazon_web_services_without_aws_suffix_remains_unclassified_end_to_end(db_session, organization):
+    company = _add_company(db_session, organization, "Amazon Web Services")
+    alumni = _add_alumni(db_session, organization, company="Amazon Web Services")
+
+    report = run_backfill(db_session, organization, apply=True)
+    db_session.commit()
+
+    db_session.refresh(company)
+    db_session.refresh(alumni)
+    assert company.industry is None
+    assert alumni.industry is None
+    assert report.unknown_companies_skipped == 1
+
+
+def test_amazon_and_amazon_web_services_aws_are_independently_explicit(db_session, organization):
+    """Both are kept as separate, explicit canonical entries - proves
+    neither is silently treated as an alias of the other."""
+    amazon_company = _add_company(db_session, organization, "Amazon")
+    amazon_alumni = _add_alumni(db_session, organization, company="Amazon")
+    aws_company = _add_company(db_session, organization, "Amazon Web Services (AWS)")
+    aws_alumni = _add_alumni(db_session, organization, company="Amazon Web Services (AWS)")
+
+    run_backfill(db_session, organization, apply=True)
+    db_session.commit()
+
+    for obj in (amazon_company, amazon_alumni, aws_company, aws_alumni):
+        db_session.refresh(obj)
+    assert amazon_company.industry == "Technology"
+    assert amazon_alumni.industry == "Technology"
+    assert aws_company.industry == "Technology"
+    assert aws_alumni.industry == "Technology"
+    assert amazon_company.name == "Amazon"
+    assert aws_company.name == "Amazon Web Services (AWS)"
+
+
+def test_bank_alone_does_not_match_bank_of_america():
+    normalized = normalize_company_name("Bank")
+    assert normalized == "bank"
+    assert resolve_curated_industry(normalized, "stars-national") is None
+
+
+def test_north_carolina_state_alone_does_not_match_the_university():
+    normalized = normalize_company_name("North Carolina State")
+    assert normalized == "north carolina state"
+    assert resolve_curated_industry(normalized, "stars-national") is None
+
+
+def test_bank_and_north_carolina_state_remain_unclassified_end_to_end(db_session, organization):
+    bank_alumni = _add_alumni(db_session, organization, company="Bank")
+    ncs_alumni = _add_alumni(db_session, organization, company="North Carolina State")
+
+    run_backfill(db_session, organization, apply=True)
+    db_session.commit()
+
+    db_session.refresh(bank_alumni)
+    db_session.refresh(ncs_alumni)
+    assert bank_alumni.industry is None
+    assert ncs_alumni.industry is None
+    assert bank_alumni.company == "Bank"
+    assert ncs_alumni.company == "North Carolina State"
+
+
+def test_eli_lilly_and_company_and_bare_eli_lilly_and_both_documented_and_deterministic():
+    """"Eli Lilly and Company" is forced by the existing (unmodified)
+    trailing-corporate-suffix strip to normalize to "eli lilly and" -
+    that is the ONLY normalized form it can ever take, so the canonical
+    mapping key must be written that way. A direct, documented
+    consequence: literal employer text "Eli Lilly and" (without
+    "Company") normalizes identically and therefore also resolves to the
+    same approved industry - this is deterministic (always the same
+    result for the same input) and does not rely on any new
+    keyword/substring/alias rule."""
+    full_name_normalized = normalize_company_name("Eli Lilly and Company")
+    bare_normalized = normalize_company_name("Eli Lilly and")
+    assert full_name_normalized == bare_normalized == "eli lilly and"
+    assert resolve_curated_industry(full_name_normalized, "stars-national") == "Pharmaceuticals"
+    assert resolve_curated_industry(bare_normalized, "stars-national") == "Pharmaceuticals"
+
+    # "Eli Lilly" alone (no trailing "and") normalizes to a different,
+    # distinct key and is NOT classified - only the "...and [Company]"
+    # form matches.
+    shorter_normalized = normalize_company_name("Eli Lilly")
+    assert shorter_normalized == "eli lilly"
+    assert resolve_curated_industry(shorter_normalized, "stars-national") is None
+
+
+def test_eli_lilly_and_company_backfills_end_to_end(db_session, organization):
+    company = _add_company(db_session, organization, "Eli Lilly and Company")
+    alumni_full = _add_alumni(db_session, organization, company="Eli Lilly and Company")
+    alumni_bare = _add_alumni(db_session, organization, company="Eli Lilly and")
+
+    run_backfill(db_session, organization, apply=True)
+    db_session.commit()
+
+    db_session.refresh(company)
+    db_session.refresh(alumni_full)
+    db_session.refresh(alumni_bare)
+    assert company.industry == "Pharmaceuticals"
+    assert alumni_full.industry == "Pharmaceuticals"
+    assert alumni_bare.industry == "Pharmaceuticals"
+    # Original employer text preserved exactly for both variants.
+    assert company.name == "Eli Lilly and Company"
+    assert alumni_full.company == "Eli Lilly and Company"
+    assert alumni_bare.company == "Eli Lilly and"
+
+
+def test_c_is_ambiguous_value_was_not_added_and_remains_unclassified():
+    normalized = normalize_company_name("c is")
+    assert normalized == "c is"
+    assert resolve_curated_industry(normalized, "stars-national") is None
+    assert not is_blocked_employer_value(normalized)
+    assert "c is" not in GLOBAL_DEFAULT_COMPANY_INDUSTRY
+    assert "c is" not in APPROVED_COMPANY_ALIASES
+
+
+def test_c_is_remains_unclassified_end_to_end(db_session, organization):
+    alumni = _add_alumni(db_session, organization, company="c is")
+
+    report = run_backfill(db_session, organization, apply=True)
+    db_session.commit()
+
+    db_session.refresh(alumni)
+    assert alumni.industry is None
+    assert report.unknown_companies_skipped == 1
+
+
+def test_second_expansion_protected_analytics_fields_unchanged(client, db_session, organization, admin_user):
+    _add_alumni(db_session, organization, full_name="A", company="Wells Fargo", job_title="Analyst", seniority="Associate")
+    _add_alumni(db_session, organization, full_name="B", company="Bank of America", job_title="VP", seniority="Manager")
+    _add_alumni(db_session, organization, full_name="C", company="c is")
+    _add_alumni(db_session, organization, full_name="D", company="not stated")
+    _add_company(db_session, organization, "Wells Fargo")
+    _add_company(db_session, organization, "Bank of America")
+
+    token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    before = _protected_summary_snapshot(_summary(client, token))
+
+    run_backfill(db_session, organization, apply=True)
+    db_session.commit()
+
+    after = _protected_summary_snapshot(_summary(client, token))
+    assert before == after

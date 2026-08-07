@@ -261,6 +261,18 @@ def require_admin_role(current_user: CurrentUser) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
 
 
+def require_alumni_role(current_user: CurrentUser) -> None:
+    """Mirrors require_admin_role above, for the (rarer) case of an
+    endpoint that must be restricted to alumni accounts specifically -
+    e.g. submitting an event speaker request - rather than merely "any
+    authenticated user" (the existing content-read/write precedent) or
+    "not an admin". Checks the account's global `users.role`, exactly
+    like require_admin_role does; this is intentionally not tied to any
+    per-organization membership role."""
+    if current_user.role != UserRole.ALUMNI.value:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Alumni account required")
+
+
 def require_admin_role_for(organization_access: OrganizationAccess) -> None:
     """Organization-scoped admin check (Phase 2): unlike require_admin_role
     above (which only ever looks at the account's global users.role), this

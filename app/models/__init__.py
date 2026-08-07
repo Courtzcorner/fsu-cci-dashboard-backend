@@ -2,6 +2,7 @@ from app.models.alumni import Alumni, AlumniOrganization
 from app.models.audit import AuditLog, CSVImport
 from app.models.content import Event, Speaker, SuperStar
 from app.models.content_version import ContentVersion
+from app.models.event_speaker_request import EventSpeakerRequest
 from app.models.legal_name import LegalNameChangeRequest
 from app.models.location_alias import LocationAlias
 from app.models.organization import Organization
@@ -23,6 +24,7 @@ __all__ = [
     "Company",
     "ContentVersion",
     "Event",
+    "EventSpeakerRequest",
     "Industry",
     "LegalNameChangeRequest",
     "LocationAlias",

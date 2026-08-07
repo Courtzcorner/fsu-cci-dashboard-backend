@@ -288,6 +288,20 @@ def _parse_bool(value: str | None) -> bool:
     return value.strip().lower() in {"true", "yes", "1", "y", "verified"}
 
 
+def _is_verified_status_text(value: str | None) -> bool:
+    """Derives the `Alumni.verified` boolean from a text-only
+    "Verification Status" column (used only when the CSV has no
+    separate Verified/Is Verified boolean column - see _parse_bool for
+    that path). Exact, case/whitespace-insensitive match on "verified"
+    only - never substring or fuzzy matching, so values like
+    "Verified Pending" or "Not Verified" are never mistaken for a
+    positive match. Never touches the stored verification_status text
+    itself, which is always preserved exactly as supplied."""
+    if value is None:
+        return False
+    return value.strip().lower() == "verified"
+
+
 def _parse_date(value: str | None) -> date | None:
     if not value:
         return None
@@ -920,7 +934,18 @@ def import_alumni_csv(
                 )
             else:
                 if raw_verification_status is not None:
+                    # verification_status is stored EXACTLY as supplied
+                    # (no lowercasing/rewriting) - it's an audit/display
+                    # string. `verified` is a SEPARATE derived boolean,
+                    # computed with an exact "verified"-only match (see
+                    # _is_verified_status_text) so analytics (which reads
+                    # only Alumni.verified) reflects it. Consistent with
+                    # the explicit-boolean-column path above: an explicit,
+                    # nonblank status value always wins on reimport, in
+                    # either direction - it is never left stale simply
+                    # because a later value doesn't say "Verified".
                     field_values["verification_status"] = raw_verification_status
+                    field_values["verified"] = _is_verified_status_text(raw_verification_status)
                 if parsed_verification_date is not None:
                     field_values["verification_date"] = parsed_verification_date
 

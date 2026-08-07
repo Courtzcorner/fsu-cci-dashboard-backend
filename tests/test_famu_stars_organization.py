@@ -11,21 +11,18 @@ Covers:
 - admin can access/import into famu-stars immediately after seeding
 - FAMU-only imports never affect FSU STARS, STARS National, or legacy
   fsu-cci data (organization-scoped import/current-import/export/analytics)
-- alumni visibility for famu-stars follows the SAME generic
-  "institution with no active dataset is hidden from non-admins" rule
-  that would apply to any other institution - UNLIKE fsu-stars/
-  stars-national, which are unconditionally exempt from that rule (see
-  app.services.temporary_alumni_context_policy). Once famu-stars has an
-  active dataset, eligible alumni receive it via the same temporary
-  compatibility policy that already covers fsu-stars/stars-national.
+- alumni visibility for famu-stars now matches the SAME unconditional
+  temporary-compatibility exemption already applied to fsu-stars/
+  stars-national (see app.services.temporary_alumni_context_policy):
+  famu-stars is visible/accessible to eligible alumni even with zero
+  active data, not gated behind the generic
+  "institution with no active dataset is hidden from non-admins" rule.
 - fsu-stars and stars-national behavior is provably unchanged by any of
   the above.
+- fsu-cci remains hidden/blocked exactly as before.
 """
 import csv
 import io
-
-import pytest
-from fastapi import HTTPException
 
 from app.deps import CurrentUser, get_authorized_organization
 from app.models.alumni import Alumni, AlumniOrganization
@@ -343,22 +340,24 @@ def test_alumni_data_for_famu_stars_reflects_only_famu_data(client, organization
 
 
 # --------------------------------------------------------------------------
-# Alumni visibility follows the generic active-dataset rule (NOT the
-# fsu-stars/stars-national unconditional exemption)
+# Alumni visibility now matches the fsu-stars/stars-national unconditional
+# exemption: famu-stars is visible/accessible to eligible alumni even with
+# zero active data (see
+# TEMPORARY_ALUMNI_SLUGS_EXEMPT_FROM_ACTIVE_DATASET_RULE).
 # --------------------------------------------------------------------------
 
 
-def test_legacy_alumni_does_not_see_famu_stars_with_no_active_dataset(db_session, alumni_user):
-    """Unlike fsu-stars/stars-national, an empty famu-stars context must
-    NOT be shown to an alumni account - the ordinary
-    "institution with no active dataset is hidden from non-admins" rule
-    still applies to it."""
+def test_legacy_alumni_sees_famu_stars_with_zero_active_dataset(db_session, alumni_user):
     _make_organization(db_session, "famu-stars", "FAMU STARS", theme_key="stars-famu")
     contexts = build_available_contexts(db_session, _current_user(alumni_user))
-    assert all(c.slug != "famu-stars" for c in contexts)
+    ctx = next((c for c in contexts if c.slug == "famu-stars"), None)
+    assert ctx is not None
+    assert ctx.has_active_dataset is False
+    assert ctx.role == "alumni"
+    assert ctx.can_import is False
 
 
-def test_legacy_alumni_sees_famu_stars_once_it_has_an_active_dataset(db_session, alumni_user):
+def test_legacy_alumni_still_sees_famu_stars_once_it_has_an_active_dataset(db_session, alumni_user):
     famu = _make_organization(db_session, "famu-stars", "FAMU STARS", theme_key="stars-famu")
     _link_active_alumni(db_session, famu)
 
@@ -370,22 +369,24 @@ def test_legacy_alumni_sees_famu_stars_once_it_has_an_active_dataset(db_session,
     assert ctx.can_import is False
 
 
-def test_alumni_with_unrelated_membership_does_not_see_empty_famu_stars(db_session, alumni_user, organization):
+def test_alumni_with_unrelated_membership_still_sees_empty_famu_stars(db_session, alumni_user, organization):
     """An alumni account whose only explicit membership excludes
-    famu-stars must not receive it via the temporary compatibility
-    policy while it has no active dataset - unlike fsu-stars/
-    stars-national, which WOULD still be granted in this situation."""
-
+    famu-stars must still receive it via the temporary compatibility
+    policy even while it has no active dataset - exactly like
+    fsu-stars/stars-national."""
     _make_organization(db_session, "famu-stars", "FAMU STARS", theme_key="stars-famu")
     db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=organization.id, role="alumni"))
     db_session.commit()
 
     contexts = build_available_contexts(db_session, _current_user(alumni_user))
-    assert all(c.slug != "famu-stars" for c in contexts)
+    ctx = next((c for c in contexts if c.slug == "famu-stars"), None)
+    assert ctx is not None
+    assert ctx.has_active_dataset is False
+    assert ctx.role == "alumni"
+    assert ctx.can_import is False
 
 
 def test_alumni_with_unrelated_membership_sees_famu_stars_once_active(db_session, alumni_user, organization):
-
     famu = _make_organization(db_session, "famu-stars", "FAMU STARS", theme_key="stars-famu")
     _link_active_alumni(db_session, famu)
     db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=organization.id, role="alumni"))
@@ -396,26 +397,22 @@ def test_alumni_with_unrelated_membership_sees_famu_stars_once_active(db_session
     assert "famu-stars" in slugs
 
 
-def test_get_authorized_organization_denies_empty_famu_stars_for_membership_restricted_alumni(
+def test_get_authorized_organization_allows_empty_famu_stars_for_membership_restricted_alumni(
     db_session, alumni_user, organization
 ):
     """get_authorized_organization (the dependency that actually
     implements the temporary compatibility policy for direct reads - see
     app.deps) must mirror build_available_contexts: a
     membership-restricted alumni account requesting an EMPTY famu-stars
-    context directly is denied - it is not granted via the temporary
-    compatibility policy until an active dataset exists. (Note:
-    GET /alumni-data itself uses the separate, deliberately unrestricted
-    get_organization_by_slug_for_current_user dependency - see that
-    function's own docstring - so this is exercised directly against
-    get_authorized_organization instead.)"""
+    context directly is granted read-context access via the temporary
+    compatibility policy, exactly like fsu-stars/stars-national."""
     _make_organization(db_session, "famu-stars", "FAMU STARS", theme_key="stars-famu")
     db_session.add(UserOrganization(user_id=alumni_user.id, organization_id=organization.id, role="alumni"))
     db_session.commit()
 
-    with pytest.raises(HTTPException) as exc_info:
-        get_authorized_organization(organization="famu-stars", current_user=_current_user(alumni_user), db=db_session)
-    assert exc_info.value.status_code == 403
+    access = get_authorized_organization(organization="famu-stars", current_user=_current_user(alumni_user), db=db_session)
+    assert access.organization.slug == "famu-stars"
+    assert access.effective_role == "alumni"
 
 
 def test_get_authorized_organization_allows_active_famu_stars_for_membership_restricted_alumni(
@@ -432,11 +429,54 @@ def test_get_authorized_organization_allows_active_famu_stars_for_membership_res
 
 
 def test_famu_stars_never_grants_more_than_alumni_role_via_compatibility_policy(db_session, alumni_user):
-    famu = _make_organization(db_session, "famu-stars", "FAMU STARS", theme_key="stars-famu")
-    _link_active_alumni(db_session, famu)
+    _make_organization(db_session, "famu-stars", "FAMU STARS", theme_key="stars-famu")
 
     access = get_authorized_organization(organization="famu-stars", current_user=_current_user(alumni_user), db=db_session)
     assert access.effective_role == "alumni"
+
+
+def test_alumni_can_directly_access_empty_famu_stars_via_alumni_data_endpoint(client, alumni_user, db_session):
+    """?organization=famu-stars must resolve for an authenticated alumni
+    user under the same compatibility behavior as fsu-stars/stars-national,
+    even before an active FAMU dataset exists."""
+    _make_organization(db_session, "famu-stars", "FAMU STARS", theme_key="stars-famu")
+    token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
+
+    response = client.get(
+        "/alumni-data", params={"organization": "famu-stars"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 200
+    assert response.json()["data"] == []
+
+
+def test_available_contexts_endpoint_shows_famu_stars_for_alumni_with_zero_data(client, alumni_user, db_session):
+    _make_organization(db_session, "famu-stars", "FAMU STARS", theme_key="stars-famu")
+    _make_organization(db_session, "fsu-stars", "FSU STARS", theme_key="stars-fsu")
+    _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    token = login(client, ALUMNI_USERNAME, ALUMNI_PASSWORD)
+
+    response = client.get("/organizations/available-contexts", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    contexts = {c["slug"]: c for c in response.json()["contexts"]}
+    assert {"famu-stars", "fsu-stars", "stars-national"} <= set(contexts.keys())
+    assert contexts["famu-stars"]["role"] == "alumni"
+    assert contexts["famu-stars"]["can_import"] is False
+    assert contexts["famu-stars"]["has_active_dataset"] is False
+
+
+def test_available_contexts_endpoint_shows_famu_stars_for_admin_with_zero_data(client, admin_user, db_session):
+    _make_organization(db_session, "famu-stars", "FAMU STARS", theme_key="stars-famu")
+    _make_organization(db_session, "fsu-stars", "FSU STARS", theme_key="stars-fsu")
+    _make_organization(db_session, "stars-national", "STARS National", context_type="national")
+    token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+
+    response = client.get("/organizations/available-contexts", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    contexts = {c["slug"]: c for c in response.json()["contexts"]}
+    assert {"famu-stars", "fsu-stars", "stars-national"} <= set(contexts.keys())
+    assert contexts["famu-stars"]["role"] == "admin"
+    assert contexts["famu-stars"]["can_import"] is True
+    assert contexts["famu-stars"]["has_active_dataset"] is False
 
 
 # --------------------------------------------------------------------------

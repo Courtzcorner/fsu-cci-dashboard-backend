@@ -206,12 +206,13 @@ def get_authorized_organization(
     effective GLOBAL role is "alumni" is additionally granted read-context
     access (never admin - see below) to `stars-national`/`fsu-stars`/
     `famu-stars` even when it HAS other UserOrganization rows that don't
-    include them. `famu-stars` additionally requires an active dataset for
-    this grant (see TEMPORARY_ALUMNI_SLUGS_EXEMPT_FROM_ACTIVE_DATASET_RULE)
-    - `stars-national`/`fsu-stars` do not. This never applies to
-    `organization`s outside those slugs, and never upgrades the granted
-    role above "alumni" - a request for any other organization the
-    account isn't a member of is still a plain 403.
+    include them, and even with zero active data for that organization
+    (see TEMPORARY_ALUMNI_SLUGS_EXEMPT_FROM_ACTIVE_DATASET_RULE - all
+    three slugs are currently exempt from the active-dataset requirement
+    that would otherwise apply). This never applies to `organization`s
+    outside those slugs, and never upgrades the granted role above
+    "alumni" - a request for any other organization the account isn't a
+    member of is still a plain 403.
     """
     from app.config import get_settings
     from app.services.organization_context_service import organization_has_active_dataset

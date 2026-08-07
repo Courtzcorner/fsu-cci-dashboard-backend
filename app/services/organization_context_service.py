@@ -23,15 +23,12 @@ TEMPORARY ALUMNI COMPATIBILITY (separate from, and layered on top of, the
 legacy fallback above - see app.services.temporary_alumni_context_policy
 for the full rationale and removal plan): regardless of an alumni
 account's UserOrganization rows (none, or some that don't include them),
-`stars-national`, `fsu-stars`, and `famu-stars` are eligible to be
-included for it. `stars-national`/`fsu-stars` are always included, with
-`has_active_dataset` reported truthfully rather than being hidden by the
-"institution with no active dataset" rule below (the original rollout
-exemption). `famu-stars` does NOT get that exemption: it is only
-included once it has an active dataset, so the generic
-"institution with no active dataset" rule still applies to it - see
-TEMPORARY_ALUMNI_SLUGS_EXEMPT_FROM_ACTIVE_DATASET_RULE. This never
-elevates role or grants import/admin capability.
+`stars-national`, `fsu-stars`, and `famu-stars` are always included for
+it, with `has_active_dataset` reported truthfully rather than being
+hidden by the "institution with no active dataset" rule below (see
+TEMPORARY_ALUMNI_SLUGS_EXEMPT_FROM_ACTIVE_DATASET_RULE - all three slugs
+currently get this exemption). This never elevates role or grants
+import/admin capability.
 
 HIDDEN CONTEXT POLICY (also temporary - see
 app.services.hidden_context_policy): `fsu-cci` is unconditionally excluded
@@ -170,10 +167,10 @@ def _temporary_alumni_compatibility_contexts(
     this environment (never invents one).
 
     A slug outside TEMPORARY_ALUMNI_SLUGS_EXEMPT_FROM_ACTIVE_DATASET_RULE
-    (currently only famu-stars) additionally requires an active dataset
-    before it's added here - preserving the generic
-    institution-with-no-active-dataset hide rule for it, unlike the
-    original two exempt dashboards.
+    would additionally require an active dataset before being added here -
+    preserving the generic institution-with-no-active-dataset hide rule
+    for it - but all three slugs above are currently exempt from that
+    check.
     """
     effective_global_role = resolve_effective_role(None, current_user.role)
     seen_slugs = {context.slug for context in already_included_slugs}

@@ -17,6 +17,7 @@ or app.routers.analytics_routes.
 import pytest
 
 from app.models.alumni import Alumni, AlumniOrganization
+from app.models.organization import Organization
 from app.models.reference import Company
 from app.services.industry_backfill_service import (
     INDUSTRY_SOURCE_COMPANY_MAPPING,
@@ -124,6 +125,37 @@ def test_initial_mapping_list_matches_the_five_approved_entries():
         "vanguard": "Financial Services",
         "cgi": "Technology Consulting",
         "northrop grumman": "Aerospace & Defense",
+        "fca fiat chrysler automobiles": "Automotive",
+        "fifth third bank": "Financial Services",
+        "goldman sachs": "Financial Services",
+        "citi": "Financial Services",
+        "florida a&m university": "Education",
+        "usf st petersburg campus": "Education",
+        "ey": "Consulting",
+        "bdo usa": "Consulting",
+        "intuit": "Technology",
+        "paylocity": "Technology",
+        "workiva": "Technology",
+        "veeva systems": "Technology",
+        "open systems healthcare": "Healthcare",
+        "aspirion": "Healthcare",
+        "electronic arts (ea)": "Media & Entertainment",
+        "leidos": "Aerospace & Defense",
+        "tech elevator": "Education Technology",
+        "tutor com": "Education Technology",
+        "butler/till": "Marketing & Advertising",
+        "state of florida": "Government",
+        "agency for health care administration": "Government",
+        "florida department of children and families": "Government",
+        "florida department of financial services": "Government",
+        "fulton county district attorneys office": "Government",
+        "defense information systems": "Government",
+        "united states department of defense": "Government",
+        "us federal government": "Government",
+        "us navy reserve": "Government",
+        "nordstrom": "Retail",
+        "donohoe construction": "Construction",
+        "waste pro usa": "Environmental Services",
     }
 
 
@@ -230,10 +262,19 @@ def test_general_motor_does_not_match_general_motors():
     assert resolve_curated_industry(normalized, "fsu-stars") is None
 
 
-def test_citi_alone_does_not_match_citi_bank():
+def test_citi_alone_does_not_match_citi_bank_via_substring():
+    """"Citi" and "Citi Bank" normalize to two DIFFERENT keys and must
+    never be conflated via any substring/prefix match. Originally this
+    asserted "Citi" alone was unclassified; the FAMU batch later added
+    "Citi" as its own separate, explicit, reviewed mapping (see
+    test_citi_and_citi_bank_remain_independently_explicit) - it still
+    resolves to the SAME industry as "Citi Bank" here purely because both
+    were independently reviewed and approved, never because one matched
+    the other as a substring."""
     normalized = normalize_company_name("Citi")
     assert normalized == "citi"
-    assert resolve_curated_industry(normalized, "fsu-stars") is None
+    assert normalized != normalize_company_name("Citi Bank")
+    assert resolve_curated_industry(normalized, "fsu-stars") == "Financial Services"
 
 
 def test_state_alone_does_not_match_state_farm():
@@ -1097,4 +1138,324 @@ def test_second_expansion_protected_analytics_fields_unchanged(client, db_sessio
     db_session.commit()
 
     after = _protected_summary_snapshot(_summary(client, token))
+    assert before == after
+
+
+# ==========================================================================
+# FAMU STARS mapping batch (first pass): new reviewed GLOBAL mappings,
+# including four newly-approved industry categories (Government, Retail,
+# Construction, Environmental Services), from a production dry-run review.
+# These are GLOBAL (not famu-stars-scoped overrides) per explicit product
+# decision - the same real-world employer/agency names have the same
+# industry regardless of which organization's alumni work there.
+# ==========================================================================
+
+
+def _make_famu_organization(db_session):
+    org = Organization(name="FAMU STARS", slug="famu-stars", context_type="institution", theme_key="stars-famu")
+    db_session.add(org)
+    db_session.commit()
+    return org
+
+
+def test_famu_batch_new_entries_present_and_existing_mappings_unchanged():
+    new_entries = {
+        "fca fiat chrysler automobiles": "Automotive",
+        "fifth third bank": "Financial Services",
+        "goldman sachs": "Financial Services",
+        "citi": "Financial Services",
+        "florida a&m university": "Education",
+        "usf st petersburg campus": "Education",
+        "ey": "Consulting",
+        "bdo usa": "Consulting",
+        "intuit": "Technology",
+        "paylocity": "Technology",
+        "workiva": "Technology",
+        "veeva systems": "Technology",
+        "open systems healthcare": "Healthcare",
+        "aspirion": "Healthcare",
+        "electronic arts (ea)": "Media & Entertainment",
+        "leidos": "Aerospace & Defense",
+        "tech elevator": "Education Technology",
+        "tutor com": "Education Technology",
+        "butler/till": "Marketing & Advertising",
+        "state of florida": "Government",
+        "agency for health care administration": "Government",
+        "florida department of children and families": "Government",
+        "florida department of financial services": "Government",
+        "fulton county district attorneys office": "Government",
+        "defense information systems": "Government",
+        "united states department of defense": "Government",
+        "us federal government": "Government",
+        "us navy reserve": "Government",
+        "nordstrom": "Retail",
+        "donohoe construction": "Construction",
+        "waste pro usa": "Environmental Services",
+    }
+    for key, industry in new_entries.items():
+        assert GLOBAL_DEFAULT_COMPANY_INDUSTRY[key] == industry
+
+    # Every existing FSU/National mapping from prior rounds is unchanged.
+    unchanged_from_prior_rounds = {
+        "capital one": "Financial Services",
+        "florida state university": "Education",
+        "tallahassee memorial healthcare": "Healthcare",
+        "deloitte": "Consulting",
+        "microsoft": "Technology",
+        "citi bank": "Financial Services",
+        "wells fargo": "Financial Services",
+        "north carolina state university": "Education",
+        "amazon": "Technology",
+        "eli lilly and": "Pharmaceuticals",
+        "cgi": "Technology Consulting",
+        "northrop grumman": "Aerospace & Defense",
+    }
+    for key, industry in unchanged_from_prior_rounds.items():
+        assert GLOBAL_DEFAULT_COMPANY_INDUSTRY[key] == industry
+
+
+def test_famu_batch_new_industry_labels_are_spelled_exactly_as_approved():
+    """The four newly-approved category labels must appear byte-for-byte
+    exactly as approved - never a variant spelling/casing."""
+    approved_labels = {"Government", "Retail", "Construction", "Environmental Services"}
+    used_labels = set(GLOBAL_DEFAULT_COMPANY_INDUSTRY.values())
+    assert approved_labels <= used_labels
+    for label in approved_labels:
+        assert label in used_labels  # exact string, not a near-variant
+
+
+@pytest.mark.parametrize(
+    "company_name,expected_industry",
+    [
+        ("FCA Fiat Chrysler Automobiles", "Automotive"),
+        ("Fifth Third Bank", "Financial Services"),
+        ("Goldman Sachs", "Financial Services"),
+        ("Citi", "Financial Services"),
+        ("Florida A&M University", "Education"),
+        ("USF St Petersburg Campus", "Education"),
+        ("EY", "Consulting"),
+        ("BDO USA", "Consulting"),
+        ("Intuit", "Technology"),
+        ("Paylocity", "Technology"),
+        ("Workiva", "Technology"),
+        ("Veeva Systems", "Technology"),
+        ("Open Systems Healthcare", "Healthcare"),
+        ("Aspirion", "Healthcare"),
+        ("Electronic Arts (EA)", "Media & Entertainment"),
+        ("Leidos", "Aerospace & Defense"),
+        ("Tech Elevator", "Education Technology"),
+        ("Tutor Com", "Education Technology"),
+        ("Butler/Till", "Marketing & Advertising"),
+        ("State of Florida", "Government"),
+        ("Agency for Health Care Administration", "Government"),
+        ("Florida Department of Children and Families", "Government"),
+        ("Florida Department of Financial Services", "Government"),
+        ("Fulton County District Attorneys Office", "Government"),
+        ("Defense Information Systems", "Government"),
+        ("United States Department of Defense", "Government"),
+        ("US Federal Government", "Government"),
+        ("US Navy Reserve", "Government"),
+        ("Nordstrom", "Retail"),
+        ("Donohoe Construction", "Construction"),
+        ("Waste Pro USA", "Environmental Services"),
+    ],
+)
+def test_famu_batch_new_mapping_resolves_via_normalized_exact_match(company_name, expected_industry):
+    normalized = normalize_company_name(company_name)
+    assert resolve_curated_industry(normalized, "famu-stars") == expected_industry
+
+
+@pytest.mark.parametrize("company_name", [
+    "FCA Fiat Chrysler Automobiles", "Fifth Third Bank", "Goldman Sachs", "Citi",
+    "Florida A&M University", "USF St Petersburg Campus", "EY", "BDO USA", "Intuit",
+    "Paylocity", "Workiva", "Veeva Systems", "Open Systems Healthcare", "Aspirion",
+    "Electronic Arts (EA)", "Leidos", "Tech Elevator", "Tutor Com", "Butler/Till",
+    "State of Florida", "Agency for Health Care Administration",
+    "Florida Department of Children and Families", "Florida Department of Financial Services",
+    "Fulton County District Attorneys Office", "Defense Information Systems",
+    "United States Department of Defense", "US Federal Government", "US Navy Reserve",
+    "Nordstrom", "Donohoe Construction", "Waste Pro USA",
+])
+def test_famu_batch_new_mapping_backfills_company_and_alumni_end_to_end(db_session, company_name):
+    famu = _make_famu_organization(db_session)
+    normalized = normalize_company_name(company_name)
+    expected_industry = resolve_curated_industry(normalized, famu.slug)
+    assert expected_industry is not None
+
+    company = _add_company(db_session, famu, company_name)
+    alumni = _add_alumni(db_session, famu, company=company_name)
+
+    run_backfill(db_session, famu, apply=True)
+    db_session.commit()
+
+    db_session.refresh(company)
+    db_session.refresh(alumni)
+    assert company.industry == expected_industry
+    assert alumni.industry == expected_industry
+    assert alumni.industry_source == INDUSTRY_SOURCE_COMPANY_MAPPING
+    # Original text must remain byte-for-byte unchanged.
+    assert company.name == company_name
+    assert alumni.company == company_name
+
+
+def test_florida_department_of_financial_services_is_government_not_financial_services():
+    """Guards against a naive keyword-based mistake: despite the literal
+    name containing "Financial Services", this is a state REGULATORY
+    AGENCY, not a financial company."""
+    normalized = normalize_company_name("Florida Department of Financial Services")
+    assert resolve_curated_industry(normalized, "famu-stars") == "Government"
+    assert resolve_curated_industry(normalized, "famu-stars") != "Financial Services"
+
+
+def test_government_entries_use_government_not_healthcare_or_military():
+    """Per explicit reviewer decision: AHCA, DISA, and US Navy Reserve are
+    "Government", never a separate "Healthcare" or "Military"/
+    "Aerospace & Defense" classification."""
+    for name in ("Agency for Health Care Administration", "Defense Information Systems", "US Navy Reserve"):
+        normalized = normalize_company_name(name)
+        industry = resolve_curated_industry(normalized, "famu-stars")
+        assert industry == "Government"
+        assert industry not in ("Healthcare", "Aerospace & Defense")
+    assert "Military" not in GLOBAL_DEFAULT_COMPANY_INDUSTRY.values()
+
+
+def test_citi_and_citi_bank_remain_independently_explicit():
+    """"Citi" (new) and "Citi Bank" (existing) are two separate, explicit
+    canonical entries - not an alias pair - proving neither silently
+    absorbs the other."""
+    citi_normalized = normalize_company_name("Citi")
+    citi_bank_normalized = normalize_company_name("Citi Bank")
+    assert citi_normalized == "citi"
+    assert citi_bank_normalized == "citi bank"
+    assert citi_normalized != citi_bank_normalized
+    assert resolve_curated_industry(citi_normalized, "famu-stars") == "Financial Services"
+    assert resolve_curated_industry(citi_bank_normalized, "famu-stars") == "Financial Services"
+
+
+@pytest.mark.parametrize(
+    "near_miss,normalized_expected",
+    [
+        ("Chrysler", "chrysler"),
+        ("JPMorgan", "jpmorgan"),
+        ("JPMorgan Chase", "jpmorgan chase"),
+        ("Chase", "chase"),
+        ("Florida A&M", "florida a&m"),
+        ("USF", "usf"),
+        ("US Navy", "us navy"),
+        ("Miami Dade College", "miami dade college"),
+        ("Bank", "bank"),
+    ],
+)
+def test_famu_batch_near_misses_do_not_match(near_miss, normalized_expected):
+    normalized = normalize_company_name(near_miss)
+    assert normalized == normalized_expected
+    assert resolve_curated_industry(normalized, "famu-stars") is None
+
+
+@pytest.mark.parametrize(
+    "unmapped_value",
+    [
+        "jpmorgan chase and",
+        "ally",
+        "management leadership for tomorrow",
+        "cot",
+        "southern",
+        "kianjr",
+        "hms meeting services llc - self-employed",
+        "futures in education",
+        "william davis ministries",
+        "christ fellowship church",
+        "bart & associates",
+        "cole engineering services",
+        "cleared 4 closing",
+        "solution foundry",
+        "miami dade college - developmental mathematics",
+        "univeral orlando resort",
+        "highpoint solutions",
+    ],
+)
+def test_famu_batch_explicitly_deferred_values_remain_unmapped(unmapped_value):
+    """Every value from the "DO NOT MAP YET" list must remain unclassified
+    - no inference, fuzzy-matching, aliasing, or cleanup was applied to
+    any of them in this batch."""
+    normalized = normalize_company_name(unmapped_value)
+    assert normalized not in GLOBAL_DEFAULT_COMPANY_INDUSTRY
+    assert normalized not in APPROVED_COMPANY_ALIASES
+    assert resolve_curated_industry(normalized, "famu-stars") is None
+
+
+def test_famu_batch_deferred_values_remain_unclassified_end_to_end(db_session):
+    famu = _make_famu_organization(db_session)
+    alumni = _add_alumni(db_session, famu, company="jpmorgan chase and")
+    alumni_ally = _add_alumni(db_session, famu, company="Ally")
+
+    report = run_backfill(db_session, famu, apply=True)
+    db_session.commit()
+
+    db_session.refresh(alumni)
+    db_session.refresh(alumni_ally)
+    assert alumni.industry is None
+    assert alumni_ally.industry is None
+    assert alumni.company == "jpmorgan chase and"
+    assert alumni_ally.company == "Ally"
+    assert report.unknown_companies_skipped == 2
+
+
+def test_famu_batch_is_org_generic_not_famu_specific_override(db_session):
+    """These mappings are GLOBAL, per explicit product decision - not a
+    famu-stars-only ORGANIZATION_COMPANY_INDUSTRY_OVERRIDES entry - so
+    they resolve identically for any organization, including fsu-stars
+    and stars-national."""
+    normalized = normalize_company_name("Goldman Sachs")
+    for slug in ("famu-stars", "fsu-stars", "stars-national", "fsu-cci"):
+        assert resolve_curated_industry(normalized, slug) == "Financial Services"
+
+
+def test_famu_batch_backfill_is_scoped_only_to_famu_stars(db_session, organization):
+    """Running the backfill for famu-stars must never touch fsu-cci's (or
+    any other organization's) Company/Alumni rows, even for an identical
+    company name."""
+    famu = _make_famu_organization(db_session)
+    famu_company = _add_company(db_session, famu, "Goldman Sachs")
+    famu_alumni = _add_alumni(db_session, famu, company="Goldman Sachs")
+    fsu_cci_company = _add_company(db_session, organization, "Goldman Sachs")
+    fsu_cci_alumni = _add_alumni(db_session, organization, company="Goldman Sachs")
+
+    run_backfill(db_session, famu, apply=True)
+    db_session.commit()
+
+    db_session.refresh(famu_company)
+    db_session.refresh(famu_alumni)
+    db_session.refresh(fsu_cci_company)
+    db_session.refresh(fsu_cci_alumni)
+    assert famu_company.industry == "Financial Services"
+    assert famu_alumni.industry == "Financial Services"
+    # fsu-cci's identical company name is untouched by the famu-stars run.
+    assert fsu_cci_company.industry is None
+    assert fsu_cci_alumni.industry is None
+
+
+def test_famu_batch_protected_analytics_fields_unchanged(client, db_session, admin_user):
+    famu = _make_famu_organization(db_session)
+    _add_alumni(db_session, famu, full_name="A", company="Goldman Sachs", job_title="Analyst", seniority="Associate")
+    _add_alumni(db_session, famu, full_name="B", company="Nordstrom", job_title="Manager", seniority="Manager")
+    _add_alumni(db_session, famu, full_name="C", company="jpmorgan chase and")
+    _add_alumni(db_session, famu, full_name="D", company="not found")
+    _add_company(db_session, famu, "Goldman Sachs")
+    _add_company(db_session, famu, "Nordstrom")
+
+    token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    before_response = client.get(
+        "/analytics/summary", params={"organization": "famu-stars"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert before_response.status_code == 200
+    before = _protected_summary_snapshot(before_response.json())
+
+    run_backfill(db_session, famu, apply=True)
+    db_session.commit()
+
+    after_response = client.get(
+        "/analytics/summary", params={"organization": "famu-stars"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    after = _protected_summary_snapshot(after_response.json())
     assert before == after

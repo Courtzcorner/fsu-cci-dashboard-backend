@@ -76,12 +76,13 @@ def _alumni_data(client, token, organization_slug="fsu-cci"):
 # --------------------------------------------------------------------------
 
 
-def test_centralized_placeholder_list_matches_the_fifteen_reviewed_values():
+def test_centralized_placeholder_list_matches_the_sixteen_reviewed_values():
     assert PLACEHOLDER_COMPANY_VALUES == {
         "not stated", "not specified", "n/a", "na", "none", "unknown",
         "unemployed", "not employed", "full-time", "full time",
         "part-time", "part time", "student",
         "linkedin not found", "linkedin not updated",
+        "not found",
     }
 
 
@@ -129,10 +130,20 @@ def test_linkedin_not_updated_all_capitalization_and_whitespace_variants_are_pla
 
 @pytest.mark.parametrize(
     "value",
+    ["not found", "Not Found", "NOT FOUND", " not found ", "Not  Found", "  NOT   found  "],
+)
+def test_not_found_all_capitalization_and_whitespace_variants_are_placeholders(value):
+    assert normalize_for_placeholder_check(value) == "not found"
+    assert is_placeholder_company_value(value)
+
+
+@pytest.mark.parametrize(
+    "value",
     [
         "Not Stated Consulting", "Unknown Ventures", "Full-Time Technologies", "Student Services Inc.",
         "LinkedIn", "LinkedIn Corporation", "LinkedIn Learning",
         "LinkedIn Not Found Consulting", "LinkedIn Updated Solutions",
+        "Not Found Consulting", "Not Found Technologies", "Foundry", "Found Solutions",
     ],
 )
 def test_similar_but_valid_company_names_are_never_excluded(value):
@@ -219,6 +230,25 @@ def test_analytics_excludes_linkedin_placeholder_values_from_top_companies(
     assert "linkedin not updated" not in company_names
     # A real company that merely contains similar words is preserved.
     assert "LinkedIn Corporation" in company_names
+    assert "Capital One" in company_names
+
+
+def test_analytics_excludes_not_found_placeholder_values_from_top_companies(
+    client, db_session, organization, admin_user
+):
+    _add_alumni(db_session, organization, full_name="A", company="not found")
+    _add_alumni(db_session, organization, full_name="B", company="Not Found")
+    _add_alumni(db_session, organization, full_name="C", company="Not Found Consulting")
+    _add_alumni(db_session, organization, full_name="D", company="Capital One")
+
+    token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    summary = _summary(client, token)
+
+    company_names = {row["name"] for row in summary["top_companies"]}
+    assert "not found" not in company_names
+    assert "Not Found" not in company_names
+    # A real company that merely contains a similar phrase is preserved.
+    assert "Not Found Consulting" in company_names
     assert "Capital One" in company_names
 
 
@@ -419,6 +449,41 @@ def test_csv_import_does_not_create_company_rows_for_linkedin_placeholders(
     assert "LinkedIn Corporation" in company_names
 
 
+CSV_WITH_NOT_FOUND_PLACEHOLDER = """First Name,Last Name,Graduation Year,Company
+Jordan,Lee,2022,not found
+Maria,Gomez,2019,Not Found
+Sam,Reyes,2021,Not Found Consulting
+"""
+
+
+def test_csv_import_normalizes_not_found_placeholder_values_to_none(client, organization, admin_user, db_session):
+    token = _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    response = _upload(client, token, CSV_WITH_NOT_FOUND_PLACEHOLDER)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["rows_with_placeholder_company_normalized"] == 2
+    jordan = db_session.query(Alumni).filter(Alumni.first_name == "Jordan").one()
+    maria = db_session.query(Alumni).filter(Alumni.first_name == "Maria").one()
+    sam = db_session.query(Alumni).filter(Alumni.first_name == "Sam").one()
+    assert jordan.company is None
+    assert maria.company is None
+    # A real company containing a similar phrase is preserved exactly.
+    assert sam.company == "Not Found Consulting"
+
+
+def test_csv_import_does_not_create_company_rows_for_not_found_placeholders(
+    client, organization, admin_user, db_session
+):
+    token = _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    _upload(client, token, CSV_WITH_NOT_FOUND_PLACEHOLDER)
+
+    company_names = {c.name for c in db_session.query(Company).filter(Company.organization_id == organization.id).all()}
+    assert "not found" not in company_names
+    assert "Not Found" not in company_names
+    assert "Not Found Consulting" in company_names
+
+
 def test_rows_with_placeholder_company_normalized_present_in_import_response_schema(
     client, organization, admin_user, db_session
 ):
@@ -483,6 +548,24 @@ def test_cleanup_dry_run_identifies_linkedin_placeholder_values(db_session, orga
     assert report.affected_alumni_counts_by_original_value == {
         "LinkedIn not found": 1,
         "LinkedIn not updated": 1,
+    }
+
+
+def test_cleanup_dry_run_identifies_not_found_placeholder_values(db_session, organization):
+    _add_alumni(db_session, organization, company="not found")
+    _add_alumni(db_session, organization, company="Not Found")
+    _add_alumni(db_session, organization, company="Not Found Consulting")
+    _add_company(db_session, organization, "not found")
+
+    report = run_cleanup(db_session, organization, apply=False)
+    db_session.rollback()
+
+    assert report.mode == "dry_run"
+    assert report.alumni_rows_with_placeholder == 2
+    assert report.company_rows_with_placeholder == 1
+    assert report.affected_alumni_counts_by_original_value == {
+        "not found": 1,
+        "Not Found": 1,
     }
 
 

@@ -74,6 +74,26 @@ app.services.industry_backfill_service.normalize_company_name):
 #
 # Note on "c is": deliberately NOT added - too ambiguous to review
 # confidently - so it remains unclassified.
+#
+# FAMU STARS reviewed batch (first pass) - added from a production dry-run
+# review, following the exact same process as every entry above (curated,
+# human-reviewed, exact-normalized-match only). Kept GLOBAL, not
+# famu-stars-specific, because these are real-world employer/institution
+# names whose industry does not depend on which organization's alumni
+# happen to work there.
+#
+# Note on "florida department of financial services": despite the literal
+# name containing "Financial Services", this is a Florida STATE REGULATORY
+# AGENCY, not a financial company - it is deliberately classified as
+# "Government", never "Financial Services". Do not "fix" this by pattern-
+# matching the name text.
+#
+# Note on the "Government" entries below (agency for health care
+# administration / defense information systems / us navy reserve): per
+# explicit reviewer decision, these use "Government" - deliberately NOT a
+# separate "Healthcare" or "Military"/"Aerospace & Defense" classification,
+# even though their names could otherwise suggest one, because they are
+# government agencies/branches, not private employers in those industries.
 GLOBAL_DEFAULT_COMPANY_INDUSTRY: dict[str, str] = {
     "capital one": "Financial Services",
     "florida state university": "Education",
@@ -115,6 +135,37 @@ GLOBAL_DEFAULT_COMPANY_INDUSTRY: dict[str, str] = {
     "vanguard": "Financial Services",
     "cgi": "Technology Consulting",
     "northrop grumman": "Aerospace & Defense",
+    "fca fiat chrysler automobiles": "Automotive",
+    "fifth third bank": "Financial Services",
+    "goldman sachs": "Financial Services",
+    "citi": "Financial Services",
+    "florida a&m university": "Education",
+    "usf st petersburg campus": "Education",
+    "ey": "Consulting",
+    "bdo usa": "Consulting",
+    "intuit": "Technology",
+    "paylocity": "Technology",
+    "workiva": "Technology",
+    "veeva systems": "Technology",
+    "open systems healthcare": "Healthcare",
+    "aspirion": "Healthcare",
+    "electronic arts (ea)": "Media & Entertainment",
+    "leidos": "Aerospace & Defense",
+    "tech elevator": "Education Technology",
+    "tutor com": "Education Technology",
+    "butler/till": "Marketing & Advertising",
+    "state of florida": "Government",
+    "agency for health care administration": "Government",
+    "florida department of children and families": "Government",
+    "florida department of financial services": "Government",
+    "fulton county district attorneys office": "Government",
+    "defense information systems": "Government",
+    "united states department of defense": "Government",
+    "us federal government": "Government",
+    "us navy reserve": "Government",
+    "nordstrom": "Retail",
+    "donohoe construction": "Construction",
+    "waste pro usa": "Environmental Services",
 }
 
 # Organization-slug-scoped overrides/additions - reviewed the same way as

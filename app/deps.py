@@ -18,7 +18,10 @@ from app.models.user import User
 from app.models.user_organization import UserOrganization
 from app.security import TokenError, decode_access_token
 from app.services.hidden_context_policy import is_hidden_organization_slug
-from app.services.temporary_alumni_context_policy import is_temporary_alumni_compatibility_slug
+from app.services.temporary_alumni_context_policy import (
+    TEMPORARY_ALUMNI_SLUGS_EXEMPT_FROM_ACTIVE_DATASET_RULE,
+    is_temporary_alumni_compatibility_slug,
+)
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -201,13 +204,17 @@ def get_authorized_organization(
     TEMPORARY ALUMNI COMPATIBILITY (see
     app.services.temporary_alumni_context_policy): an account whose
     effective GLOBAL role is "alumni" is additionally granted read-context
-    access (never admin - see below) to `stars-national`/`fsu-stars` even
-    when it HAS other UserOrganization rows that don't include them. This
-    never applies to `organization`s outside those two slugs, and never
-    upgrades the granted role above "alumni" - a request for any other
-    organization the account isn't a member of is still a plain 403.
+    access (never admin - see below) to `stars-national`/`fsu-stars`/
+    `famu-stars` even when it HAS other UserOrganization rows that don't
+    include them. `famu-stars` additionally requires an active dataset for
+    this grant (see TEMPORARY_ALUMNI_SLUGS_EXEMPT_FROM_ACTIVE_DATASET_RULE)
+    - `stars-national`/`fsu-stars` do not. This never applies to
+    `organization`s outside those slugs, and never upgrades the granted
+    role above "alumni" - a request for any other organization the
+    account isn't a member of is still a plain 403.
     """
     from app.config import get_settings
+    from app.services.organization_context_service import organization_has_active_dataset
 
     slug = organization or get_settings().default_organization_slug
     organization_record = db.query(Organization).filter(Organization.slug == slug).first()
@@ -229,7 +236,11 @@ def get_authorized_organization(
     )
     if matching_membership is None:
         effective_global_role = resolve_effective_role(None, current_user.role)
-        if is_temporary_alumni_compatibility_slug(slug, effective_global_role):
+        slug_exempt_from_active_dataset_rule = slug in TEMPORARY_ALUMNI_SLUGS_EXEMPT_FROM_ACTIVE_DATASET_RULE
+        if is_temporary_alumni_compatibility_slug(slug, effective_global_role) and (
+            slug_exempt_from_active_dataset_rule
+            or organization_has_active_dataset(db, organization_record.id)
+        ):
             # Fails closed automatically: is_temporary_alumni_compatibility_slug
             # only ever matches effective_global_role == "alumni" - never
             # None (invalid role) and never "admin" - so this can never

@@ -92,6 +92,11 @@ class ImportResult(BaseModel):
     rows_with_university: int = 0
     rows_with_job_title: int = 0
     rows_with_company: int = 0
+    # See app.services.csv_import_service.ImportSummary.rows_with_placeholder_company_normalized -
+    # how many rows had a placeholder/missing-data value (e.g. "Not
+    # stated") in the company column, normalized to None instead of
+    # being stored as a company.
+    rows_with_placeholder_company_normalized: int = 0
     rows_with_location: int = 0
     rows_with_city: int = 0
     rows_with_state: int = 0

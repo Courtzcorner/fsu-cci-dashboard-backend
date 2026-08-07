@@ -194,6 +194,7 @@ async def import_alumni(
         rows_with_university=summary.rows_with_university,
         rows_with_job_title=summary.rows_with_job_title,
         rows_with_company=summary.rows_with_company,
+        rows_with_placeholder_company_normalized=summary.rows_with_placeholder_company_normalized,
         rows_with_location=summary.rows_with_location,
         rows_with_city=summary.rows_with_city,
         rows_with_state=summary.rows_with_state,

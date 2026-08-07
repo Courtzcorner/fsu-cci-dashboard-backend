@@ -41,6 +41,7 @@ from app.schemas.analytics import (
     StateCount,
     Totals,
 )
+from app.services.company_placeholder_policy import company_placeholder_sql_exclusion
 from app.services.effective_alumni_service import (
     EffectiveColumns,
     confirmed_profile_alias,
@@ -70,17 +71,34 @@ def _with_profile_join(query, profile_alias):
     return query.outerjoin(profile_alias, confirmed_profile_join_condition(profile_alias))
 
 
-def _grouped_counts(db: Session, organization_id: str, column, profile_alias, limit: Optional[int] = None) -> list[tuple]:
+def _grouped_counts(
+    db: Session,
+    organization_id: str,
+    column,
+    profile_alias,
+    limit: Optional[int] = None,
+    extra_filters: tuple = (),
+) -> list[tuple]:
     """SELECT <column>, COUNT(*) ... GROUP BY <column> ORDER BY COUNT DESC.
     Blank/null values are excluded - they belong in data_quality, not a
     named bucket. `column` may be a raw Alumni column or an "effective"
-    CASE expression from app.services.effective_alumni_service."""
-    query = _with_profile_join(
-        db.query(column, func.count(Alumni.id))
-        .select_from(Alumni)
-        .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id),
-        profile_alias,
-    ).filter(*_active_filter(organization_id), column.isnot(None)).group_by(column)
+    CASE expression from app.services.effective_alumni_service.
+
+    `extra_filters` is an additive, opt-in hook (empty by default, so
+    every existing call site is unaffected) - used ONLY to exclude
+    placeholder values from company-derived aggregations (see
+    app.services.company_placeholder_policy). Never used for any other
+    field."""
+    query = (
+        _with_profile_join(
+            db.query(column, func.count(Alumni.id))
+            .select_from(Alumni)
+            .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id),
+            profile_alias,
+        )
+        .filter(*_active_filter(organization_id), column.isnot(None), *extra_filters)
+        .group_by(column)
+    )
     # Secondary sort key makes tie-breaking deterministic (e.g. many
     # distinct values each with count=1) instead of depending on
     # unspecified database row-scan order.
@@ -100,14 +118,19 @@ def _count_where(db: Session, organization_id: str, profile_alias, *extra_filter
     return query.filter(*_active_filter(organization_id), *extra_filters).scalar() or 0
 
 
-def _distinct_count(db: Session, organization_id: str, column, profile_alias) -> int:
+def _distinct_count(
+    db: Session, organization_id: str, column, profile_alias, extra_filters: tuple = ()
+) -> int:
+    """`extra_filters` is the same additive, opt-in hook as in
+    _grouped_counts above - empty by default, used only to exclude
+    placeholder values from a company-derived distinct count."""
     query = _with_profile_join(
         db.query(func.count(func.distinct(column)))
         .select_from(Alumni)
         .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id),
         profile_alias,
     )
-    return query.filter(*_active_filter(organization_id), column.isnot(None)).scalar() or 0
+    return query.filter(*_active_filter(organization_id), column.isnot(None), *extra_filters).scalar() or 0
 
 
 def _top_companies_by_industry(db: Session, organization_id: str, eff, profile_alias) -> list[CompanyGroup]:
@@ -121,6 +144,10 @@ def _top_companies_by_industry(db: Session, organization_id: str, eff, profile_a
     app.services.classification_service.resolve_industry) - never a
     keyword guess from the company name - so no extra filtering is
     needed here to satisfy "verified or imported industry values only".
+    A placeholder employer value (see
+    app.services.company_placeholder_policy) is excluded here too - it
+    is never a real company, regardless of whether it happens to also
+    have an industry value attached.
     """
     rows = (
         _with_profile_join(
@@ -129,7 +156,12 @@ def _top_companies_by_industry(db: Session, organization_id: str, eff, profile_a
             .join(AlumniOrganization, AlumniOrganization.alumni_id == Alumni.id),
             profile_alias,
         )
-        .filter(*_active_filter(organization_id), eff.industry.isnot(None), eff.company.isnot(None))
+        .filter(
+            *_active_filter(organization_id),
+            eff.industry.isnot(None),
+            eff.company.isnot(None),
+            company_placeholder_sql_exclusion(eff.company),
+        )
         .group_by(eff.industry, eff.company)
         .order_by(eff.industry.asc(), func.count(Alumni.id).desc(), eff.company.asc())
         .all()
@@ -211,7 +243,9 @@ def get_analytics_summary(
     )
 
     data_quality = DataQuality(
-        with_company=_count_where(db, org_id, profile_alias, eff.company.isnot(None)),
+        with_company=_count_where(
+            db, org_id, profile_alias, eff.company.isnot(None), company_placeholder_sql_exclusion(eff.company)
+        ),
         with_job_title=_count_where(db, org_id, profile_alias, eff.job_title.isnot(None)),
         with_location=_count_where(db, org_id, profile_alias, Alumni.location_original.isnot(None)),
         with_university=_count_where(db, org_id, profile_alias, eff.university.isnot(None)),
@@ -221,7 +255,9 @@ def get_analytics_summary(
     )
 
     # --- Combined Companies + Industries page ---
-    unique_companies = _distinct_count(db, org_id, eff.company, profile_alias)
+    unique_companies = _distinct_count(
+        db, org_id, eff.company, profile_alias, extra_filters=(company_placeholder_sql_exclusion(eff.company),)
+    )
     classified_industries = _distinct_count(db, org_id, eff.industry, profile_alias)
     alumni_with_company = data_quality.with_company
     alumni_with_industry = _count_where(db, org_id, profile_alias, eff.industry.isnot(None))
@@ -240,7 +276,14 @@ def get_analytics_summary(
 
     top_companies = [
         NamedCount(name=name, count=count)
-        for name, count in _grouped_counts(db, org_id, eff.company, profile_alias, TOP_COMPANIES_LIMIT)
+        for name, count in _grouped_counts(
+            db,
+            org_id,
+            eff.company,
+            profile_alias,
+            TOP_COMPANIES_LIMIT,
+            extra_filters=(company_placeholder_sql_exclusion(eff.company),),
+        )
     ]
 
     # Denominator is alumni WITH A KNOWN COMPANY, per spec - never the

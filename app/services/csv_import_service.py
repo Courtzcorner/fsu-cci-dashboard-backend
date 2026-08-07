@@ -34,6 +34,7 @@ from app.models.organization import Organization
 from app.models.reference import Company, Industry, University
 from app.services.audit_service import record_audit_log
 from app.services.classification_service import build_company_industry_map, classify_alumni_fields
+from app.services.company_placeholder_policy import is_placeholder_company_value
 from app.services.content_version_service import bump_for_csv_import
 from app.services.location_normalization_service import normalize_city_state, normalize_location
 
@@ -440,6 +441,14 @@ class ImportSummary:
     rows_with_university: int = 0
     rows_with_job_title: int = 0
     rows_with_company: int = 0
+    # A placeholder/missing-data value (e.g. "Not stated", "N/A" - see
+    # app.services.company_placeholder_policy) in the CSV's company
+    # column is never stored as a company - it is normalized to None
+    # before classification/storage. This counts how many rows that
+    # happened for, so the fact is still visible in the import audit
+    # trail even though rows_with_company (above) now correctly counts
+    # only genuine employer values.
+    rows_with_placeholder_company_normalized: int = 0
     rows_with_location: int = 0
     rows_with_city: int = 0
     rows_with_state: int = 0
@@ -809,6 +818,20 @@ def import_alumni_csv(
 
             job_title = _normalize_whitespace(resolved.get("job_title"))
             company = _normalize_whitespace(resolved.get("company"))
+            # A placeholder/missing-data value (e.g. "Not stated", "N/A")
+            # is never a real employer - normalize it to None here, at
+            # the single point every downstream consumer (industry
+            # classification below, field_values["company"], and the
+            # Company reference-table get-or-create) already funnels
+            # through, BEFORE any of them ever see it. Because
+            # field_values only sets "company" when truthy (see below),
+            # this also means an update with only a placeholder value
+            # never overwrites an existing real company already in the
+            # database - the same "safe update" rule every other field
+            # already follows.
+            if company is not None and is_placeholder_company_value(company):
+                summary.rows_with_placeholder_company_normalized += 1
+                company = None
 
             classification = classify_alumni_fields(
                 job_title=job_title,

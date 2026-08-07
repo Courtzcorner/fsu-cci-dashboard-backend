@@ -21,9 +21,11 @@ Matching rules (deliberately minimal and narrow):
     "not stated")
   - EXACT match only after normalization - never substring/contains/
     keyword/fuzzy/AI/web. "Not Stated Consulting", "Unknown Ventures",
-    "Full-Time Technologies", and "Student Services Inc." are real
-    company names and must never be excluded - none of them equals a
-    placeholder value even after normalization.
+    "Full-Time Technologies", "Student Services Inc.", "LinkedIn",
+    "LinkedIn Corporation", "LinkedIn Learning", "LinkedIn Not Found
+    Consulting", and "LinkedIn Updated Solutions" are real company names
+    and must never be excluded - none of them equals a placeholder value
+    even after normalization.
   - no punctuation stripping and no corporate-suffix stripping (unlike
     app.services.industry_mapping_data, which is a different, unrelated
     feature with different goals) - "full-time" and "full time" are
@@ -50,6 +52,8 @@ PLACEHOLDER_COMPANY_VALUES: frozenset = frozenset({
     "part-time",
     "part time",
     "student",
+    "linkedin not found",
+    "linkedin not updated",
 })
 
 _WHITESPACE_RE = re.compile(r"\s+")

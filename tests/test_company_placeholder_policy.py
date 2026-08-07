@@ -76,11 +76,12 @@ def _alumni_data(client, token, organization_slug="fsu-cci"):
 # --------------------------------------------------------------------------
 
 
-def test_centralized_placeholder_list_matches_the_thirteen_reviewed_values():
+def test_centralized_placeholder_list_matches_the_fifteen_reviewed_values():
     assert PLACEHOLDER_COMPANY_VALUES == {
         "not stated", "not specified", "n/a", "na", "none", "unknown",
         "unemployed", "not employed", "full-time", "full time",
         "part-time", "part time", "student",
+        "linkedin not found", "linkedin not updated",
     }
 
 
@@ -104,7 +105,35 @@ def test_every_reviewed_placeholder_value_is_recognized_case_and_whitespace_inse
 
 @pytest.mark.parametrize(
     "value",
-    ["Not Stated Consulting", "Unknown Ventures", "Full-Time Technologies", "Student Services Inc."],
+    [
+        "LinkedIn not found", "linkedin not found", "LINKEDIN NOT FOUND", " LinkedIn not found ",
+        "LinkedIn  not   found", "LinkedIn Not Found",
+    ],
+)
+def test_linkedin_not_found_all_capitalization_and_whitespace_variants_are_placeholders(value):
+    assert normalize_for_placeholder_check(value) == "linkedin not found"
+    assert is_placeholder_company_value(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "LinkedIn not updated", "linkedin not updated", "LINKEDIN NOT UPDATED", " LinkedIn not updated ",
+        "LinkedIn  not   updated", "LinkedIn Not Updated",
+    ],
+)
+def test_linkedin_not_updated_all_capitalization_and_whitespace_variants_are_placeholders(value):
+    assert normalize_for_placeholder_check(value) == "linkedin not updated"
+    assert is_placeholder_company_value(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Not Stated Consulting", "Unknown Ventures", "Full-Time Technologies", "Student Services Inc.",
+        "LinkedIn", "LinkedIn Corporation", "LinkedIn Learning",
+        "LinkedIn Not Found Consulting", "LinkedIn Updated Solutions",
+    ],
 )
 def test_similar_but_valid_company_names_are_never_excluded(value):
     assert not is_placeholder_company_value(value)
@@ -171,6 +200,25 @@ def test_analytics_excludes_placeholder_values_from_top_companies_before_any_cle
     assert "Not stated" not in company_names
     assert "not stated" not in company_names
     assert "Not Stated" not in company_names
+    assert "Capital One" in company_names
+
+
+def test_analytics_excludes_linkedin_placeholder_values_from_top_companies(
+    client, db_session, organization, admin_user
+):
+    _add_alumni(db_session, organization, full_name="A", company="LinkedIn not found")
+    _add_alumni(db_session, organization, full_name="B", company="linkedin not updated")
+    _add_alumni(db_session, organization, full_name="C", company="LinkedIn Corporation")
+    _add_alumni(db_session, organization, full_name="D", company="Capital One")
+
+    token = login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    summary = _summary(client, token)
+
+    company_names = {row["name"] for row in summary["top_companies"]}
+    assert "LinkedIn not found" not in company_names
+    assert "linkedin not updated" not in company_names
+    # A real company that merely contains similar words is preserved.
+    assert "LinkedIn Corporation" in company_names
     assert "Capital One" in company_names
 
 
@@ -336,6 +384,41 @@ Jordan,Lee,2022,linkedin.com/in/jordanlee,Not stated
     assert jordan.company == "Capital One"
 
 
+CSV_WITH_LINKEDIN_PLACEHOLDERS = """First Name,Last Name,Graduation Year,Company
+Jordan,Lee,2022,LinkedIn not found
+Maria,Gomez,2019,LinkedIn not updated
+Sam,Reyes,2021,LinkedIn Corporation
+"""
+
+
+def test_csv_import_normalizes_linkedin_placeholder_values_to_none(client, organization, admin_user, db_session):
+    token = _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    response = _upload(client, token, CSV_WITH_LINKEDIN_PLACEHOLDERS)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["rows_with_placeholder_company_normalized"] == 2
+    jordan = db_session.query(Alumni).filter(Alumni.first_name == "Jordan").one()
+    maria = db_session.query(Alumni).filter(Alumni.first_name == "Maria").one()
+    sam = db_session.query(Alumni).filter(Alumni.first_name == "Sam").one()
+    assert jordan.company is None
+    assert maria.company is None
+    # A real company containing similar words is preserved exactly.
+    assert sam.company == "LinkedIn Corporation"
+
+
+def test_csv_import_does_not_create_company_rows_for_linkedin_placeholders(
+    client, organization, admin_user, db_session
+):
+    token = _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    _upload(client, token, CSV_WITH_LINKEDIN_PLACEHOLDERS)
+
+    company_names = {c.name for c in db_session.query(Company).filter(Company.organization_id == organization.id).all()}
+    assert "LinkedIn not found" not in company_names
+    assert "LinkedIn not updated" not in company_names
+    assert "LinkedIn Corporation" in company_names
+
+
 def test_rows_with_placeholder_company_normalized_present_in_import_response_schema(
     client, organization, admin_user, db_session
 ):
@@ -383,6 +466,24 @@ def test_cleanup_apply_nulls_alumni_company_and_deletes_company_row(db_session, 
     assert db_session.query(Company).filter(Company.id == company.id).first() is None
     assert report.alumni_rows_with_placeholder == 1
     assert report.company_rows_with_placeholder == 1
+
+
+def test_cleanup_dry_run_identifies_linkedin_placeholder_values(db_session, organization):
+    _add_alumni(db_session, organization, company="LinkedIn not found")
+    _add_alumni(db_session, organization, company="LinkedIn not updated")
+    _add_alumni(db_session, organization, company="LinkedIn Corporation")
+    _add_company(db_session, organization, "LinkedIn not found")
+
+    report = run_cleanup(db_session, organization, apply=False)
+    db_session.rollback()
+
+    assert report.mode == "dry_run"
+    assert report.alumni_rows_with_placeholder == 2
+    assert report.company_rows_with_placeholder == 1
+    assert report.affected_alumni_counts_by_original_value == {
+        "LinkedIn not found": 1,
+        "LinkedIn not updated": 1,
+    }
 
 
 def test_cleanup_reports_affected_rows_grouped_by_exact_original_value(db_session, organization):

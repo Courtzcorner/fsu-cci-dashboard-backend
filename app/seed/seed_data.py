@@ -13,20 +13,22 @@ ORGANIZATIONS_SEED_DATA = [
     {"name": "FSU College of Communication and Information", "slug": "fsu-cci"},
     {"name": "FSU STARS", "slug": "fsu-stars"},
     {"name": "STARS National", "slug": "stars-national"},
+    {"name": "FAMU STARS", "slug": "famu-stars"},
 ]
 
 # Phase 1 multi-institution context metadata (see app.models.organization
 # context_type/theme_key). Keyed by slug so seed_organizations() below can
-# apply it idempotently to ONLY these three known, already-seeded
-# organizations - never renaming/merging/deleting anything, and never
-# touching `name`/`slug` for an already-existing row. `fsu-cci` keeps a
-# null theme_key: it is a legacy organization whose production data
-# ownership has not yet been confirmed (see architecture analysis), so no
-# frontend theme is assigned to it in this phase.
+# apply it idempotently to ONLY these known, already-seeded organizations -
+# never renaming/merging/deleting anything, and never touching `name`/`slug`
+# for an already-existing row. `fsu-cci` keeps a null theme_key: it is a
+# legacy organization whose production data ownership has not yet been
+# confirmed (see architecture analysis), so no frontend theme is assigned
+# to it in this phase.
 ORGANIZATION_CONTEXT_METADATA = {
     "stars-national": {"context_type": "national", "theme_key": "stars-national"},
     "fsu-stars": {"context_type": "institution", "theme_key": "stars-fsu"},
     "fsu-cci": {"context_type": "institution", "theme_key": None},
+    "famu-stars": {"context_type": "institution", "theme_key": "stars-famu"},
 }
 
 

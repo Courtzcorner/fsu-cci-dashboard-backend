@@ -692,4 +692,4 @@ def test_alembic_has_a_single_head():
 
     heads = script_dir.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "90745d7d8acb"
+    assert heads[0] == "d4e5f6a7b8c9"

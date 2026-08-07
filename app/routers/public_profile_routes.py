@@ -22,12 +22,15 @@ from app.services.profile_link_service import sync_link_review_status
 router = APIRouter(tags=["public-profiles"])
 
 
-@router.get("/public-profiles/{alumni_id}", response_model=PublicProfileOut)
-def get_public_profile(
-    alumni_id: str,
-    current_user: CurrentUser = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> PublicProfileOut:
+def build_public_profile(db: Session, alumni_id: str) -> PublicProfileOut:
+    """Builds the same privacy-gated public profile view used by
+    `GET /public-profiles/{alumni_id}` below. Extracted so any other
+    caller (e.g. an admin viewing an alumni speaker request's profile -
+    see app.routers.content_routes) reuses this exact logic instead of
+    re-implementing or loosening the privacy rules. Callers are
+    responsible for their own authorization/scoping *before* calling
+    this - it only ever returns what the alumnus has made public,
+    regardless of who is asking."""
     alumni = db.get(Alumni, alumni_id)
     if alumni is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Alumni record not found")
@@ -128,3 +131,12 @@ def get_public_profile(
         ]
 
     return out
+
+
+@router.get("/public-profiles/{alumni_id}", response_model=PublicProfileOut)
+def get_public_profile(
+    alumni_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PublicProfileOut:
+    return build_public_profile(db, alumni_id)

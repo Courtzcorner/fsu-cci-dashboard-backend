@@ -49,6 +49,34 @@ class EventUpdate(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class SpeakerRequestCreate(BaseModel):
+    message: Optional[str] = Field(None, max_length=2000)
+
+
+class SpeakerRequestOut(BaseModel):
+    """Admin-facing list item for a single speaker request. Only the same
+    already-safe directory fields shown elsewhere (e.g. GET /alumni-data)
+    are included here - no private profile data. Use
+    GET /admin/speaker-requests/{request_id}/alumni-profile (returning
+    PublicProfileOut) for the alumnus's public profile."""
+
+    id: str
+    organization_id: str
+    event_id: str
+    alumni_id: str
+    alumni_full_name: str
+    alumni_job_title: Optional[str] = None
+    alumni_company: Optional[str] = None
+    message: Optional[str] = None
+    status: str
+    selected_by_user_id: Optional[str] = None
+    selected_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class SpeakerOut(BaseModel):
     id: str
     organization_id: str

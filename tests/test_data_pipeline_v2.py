@@ -187,9 +187,10 @@ def test_analytics_summary_new_shape_matches_direct_sql_counts(client, organizat
     assert body["dataset"]["csv_import_id"]
     assert body["totals"]["alumni"] == 40
     # The canonical CSV format only has a free-text "Verification Status"
-    # column, not a dedicated boolean - `verified` reflects that no
-    # explicit boolean column was provided.
-    assert body["totals"]["verified"] == 0
+    # column, not a dedicated boolean - every generated row's status is
+    # exactly "Verified", so `verified` is derived True for all 40 (see
+    # _is_verified_status_text in app.services.csv_import_service).
+    assert body["totals"]["verified"] == 40
 
     direct_university_count = (
         db_session.query(Alumni.university)

@@ -75,6 +75,7 @@ def main() -> None:
         print(f"  rows_with_university : {summary.rows_with_university}")
         print(f"  rows_with_job_title  : {summary.rows_with_job_title}")
         print(f"  rows_with_company    : {summary.rows_with_company}")
+        print(f"  rows_with_placeholder_company_normalized : {summary.rows_with_placeholder_company_normalized}")
         print(f"  rows_with_location   : {summary.rows_with_location}")
         if summary.row_errors:
             print(f"  row_errors ({len(summary.row_errors)}):")
